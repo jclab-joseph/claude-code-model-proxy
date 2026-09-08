@@ -338,3 +338,53 @@ func TestStripProxySignaturesRemovesOnlyOurBlocks(t *testing.T) {
 		t.Fatal("an unrelated message was altered")
 	}
 }
+
+func TestOutputConfigEffortWinsOverThinkingBudget(t *testing.T) {
+	// A client that states an effort means it, whatever the token budget
+	// alongside it implies.
+	body := mustConvert(t, Options{}, `{
+		"model":"gpt-5.5",
+		"messages":[],
+		"thinking":{"type":"enabled","budget_tokens":1024},
+		"output_config":{"effort":"xhigh"}
+	}`)
+	if got := body.Get("reasoning.effort").String(); got != "xhigh" {
+		t.Fatalf("reasoning.effort = %q, want xhigh", got)
+	}
+}
+
+func TestAdaptiveThinkingWithoutAnEffort(t *testing.T) {
+	body := mustConvert(t, Options{}, `{
+		"model":"gpt-5.5",
+		"messages":[],
+		"thinking":{"type":"adaptive"}
+	}`)
+	if got := body.Get("reasoning.effort").String(); got != "xhigh" {
+		t.Fatalf("reasoning.effort = %q, want xhigh for adaptive thinking", got)
+	}
+}
+
+func TestEffortFrom(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		fallback string
+		want     string
+	}{
+		{"no preference", `{}`, "medium", "medium"},
+		{"empty fallback", `{}`, "", "medium"},
+		{"explicit effort", `{"output_config":{"effort":"high"}}`, "medium", "high"},
+		{"effort is trimmed and lowercased", `{"output_config":{"effort":"  XHigh "}}`, "medium", "xhigh"},
+		{"effort beats budget", `{"thinking":{"type":"enabled","budget_tokens":512},"output_config":{"effort":"high"}}`, "medium", "high"},
+		{"small budget", `{"thinking":{"type":"enabled","budget_tokens":2048}}`, "medium", "low"},
+		{"large budget", `{"thinking":{"type":"enabled","budget_tokens":60000}}`, "medium", "xhigh"},
+		{"disabled thinking", `{"thinking":{"type":"disabled"}}`, "medium", "low"},
+		{"adaptive thinking", `{"thinking":{"type":"adaptive"}}`, "medium", "xhigh"},
+		{"invalid JSON", `nope`, "high", "high"},
+	}
+	for _, c := range cases {
+		if got := EffortFrom([]byte(c.body), c.fallback); got != c.want {
+			t.Fatalf("%s: EffortFrom = %q, want %q", c.name, got, c.want)
+		}
+	}
+}

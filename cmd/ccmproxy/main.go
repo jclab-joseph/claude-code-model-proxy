@@ -523,6 +523,7 @@ func printSettingsJSON(registry *codex.Registry) error {
 	fmt.Fprintf(os.Stderr, "#   jq -s '.[0] * .[1]' %s /tmp/picker.json > /tmp/merged.json\n", settingsPath)
 	fmt.Fprintf(os.Stderr, "#   mv /tmp/merged.json %s\n", settingsPath)
 	fmt.Fprintf(os.Stderr, "# Restart Claude Code, then open /model.\n")
+	fmt.Fprintf(os.Stderr, "# Reasoning effort is Claude Code's own control: /effort or --effort.\n")
 	return nil
 }
 

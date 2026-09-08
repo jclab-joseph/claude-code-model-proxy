@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/codex"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/logx"
@@ -18,16 +19,40 @@ import (
 // sseReadLimit caps a single upstream event payload.
 const sseReadLimit = 32 << 20
 
-// serveCodexMessages answers a Messages request from the Codex backend.
-func (r *Router) serveCodexMessages(w http.ResponseWriter, req *http.Request, body []byte, resolution codex.Resolution) {
+// resolveEffort decides the reasoning effort for one request, and is the only
+// place that decides it.
+//
+// The order is: an effort pinned in the model name, then whatever the client
+// asked for, then the model's default. Claude Code sends its /effort and
+// --effort choice as output_config.effort, which is why a per-effort model id
+// is not needed to control it. The result is always a concrete level, clamped
+// to what the real model supports.
+func resolveEffort(body []byte, resolution codex.Resolution) string {
+	effort := resolution.Effort
+	if effort == "" {
+		effort = translate.EffortFrom(body, resolution.Model.DefaultEffort)
+	}
+	return resolution.Model.ClampEffort(effort)
+}
+
+// serveCodexMessages answers a Messages request from the Codex backend. effort
+// comes from resolveEffort, so the value logged upstream and the value sent
+// are the same one.
+func (r *Router) serveCodexMessages(w http.ResponseWriter, req *http.Request, body []byte, resolution codex.Resolution, effort string) {
 	if r.backend == nil {
 		writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "the Codex backend is not configured")
 		return
 	}
 
+	if logx.Enabled(logx.LevelDebug) {
+		logx.Debugf("codex effort: model name=%q client=%q -> %q (supported: %s)",
+			resolution.Effort, gjson.GetBytes(body, "output_config.effort").String(),
+			effort, strings.Join(resolution.Model.ReasoningLevel, ","))
+	}
+
 	translated, err := translate.ClaudeToCodex(translate.Options{
 		Model:         resolution.Model.ID,
-		Effort:        resolution.Effort,
+		Effort:        effort,
 		DefaultEffort: resolution.Model.DefaultEffort,
 	}, body)
 	if err != nil {

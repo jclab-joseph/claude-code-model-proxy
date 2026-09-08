@@ -76,7 +76,7 @@ func ClaudeToCodex(opts Options, raw []byte) (*Request, error) {
 
 	effort := opts.Effort
 	if effort == "" {
-		effort = effortFromThinking(root, opts.DefaultEffort)
+		effort = effortFrom(root, opts.DefaultEffort)
 	}
 	body, _ = sjson.SetBytes(body, "reasoning.effort", effort)
 	// Reasoning summaries are opt-in on the Responses API and are what becomes
@@ -456,12 +456,27 @@ func schemaMissesRequired(schema gjson.Result) bool {
 	return false
 }
 
-// effortFromThinking maps the Claude thinking configuration onto a Responses
-// reasoning effort.
-func effortFromThinking(root gjson.Result, fallback string) string {
+// EffortFrom reads the client's reasoning preference out of an Anthropic
+// Messages request and maps it onto a Responses reasoning effort. fallback is
+// returned when the request states no preference.
+//
+// An explicit output_config.effort wins over everything else: it is what
+// Claude Code's /effort and --effort set, and it says exactly what the user
+// asked for rather than implying it through a token budget.
+func EffortFrom(raw []byte, fallback string) string {
+	return effortFrom(gjson.ParseBytes(raw), fallback)
+}
+
+func effortFrom(root gjson.Result, fallback string) string {
 	if fallback == "" {
 		fallback = "medium"
 	}
+	if effort := root.Get("output_config.effort"); effort.Type == gjson.String {
+		if value := strings.ToLower(strings.TrimSpace(effort.String())); value != "" {
+			return value
+		}
+	}
+
 	thinking := root.Get("thinking")
 	if !thinking.IsObject() {
 		return fallback
@@ -483,11 +498,7 @@ func effortFromThinking(root gjson.Result, fallback string) string {
 			return "xhigh"
 		}
 	case "adaptive", "auto":
-		if effort := root.Get("output_config.effort"); effort.Type == gjson.String {
-			if value := strings.ToLower(strings.TrimSpace(effort.String())); value != "" {
-				return value
-			}
-		}
+		// Adaptive thinking with no stated effort means "think as needed".
 		return "xhigh"
 	case "disabled":
 		return "low"

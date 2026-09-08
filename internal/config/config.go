@@ -29,6 +29,11 @@ type Codex struct {
 	Models []string `json:"models,omitempty"`
 	// EffortVariants adds one model entry per supported reasoning level
 	// (for example gpt-5.5-high) to the advertised model list.
+	//
+	// It is off by default: Claude Code selects effort itself, with /effort
+	// and --effort, and sends it with the request, so per-effort ids only
+	// multiply the picker rows. Turn it on for a client that has no effort
+	// control of its own.
 	EffortVariants bool `json:"effort_variants"`
 	// ModelPrefix, when set, is accepted (and advertised) in front of every
 	// Codex model id, e.g. "codex/gpt-5.5".
@@ -188,7 +193,7 @@ func Default() *Config {
 			BaseURL:        "https://chatgpt.com/backend-api/codex",
 			UserAgent:      "codex-tui/0.153.3 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.153.3)",
 			Originator:     "codex-tui",
-			EffortVariants: true,
+			EffortVariants: false,
 			CallbackPort:   1455,
 			UseCLIAuth:     true,
 		},

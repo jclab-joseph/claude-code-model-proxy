@@ -242,3 +242,34 @@ func TestResolveStripsTheContextWindowSuffix(t *testing.T) {
 		t.Fatal("gpt-5.5[9m] must not resolve")
 	}
 }
+
+func TestClampEffort(t *testing.T) {
+	gpt55, ok := NewRegistry(nil, "", false).Lookup("gpt-5.5")
+	if !ok {
+		t.Fatal("gpt-5.5 is not in the catalog")
+	}
+	astra, ok := NewRegistry(nil, "", false).Lookup("gpt-6-astra")
+	if !ok {
+		t.Fatal("gpt-6-astra is not in the catalog")
+	}
+
+	cases := []struct {
+		model  Model
+		effort string
+		want   string
+	}{
+		{gpt55, "", ""}, // no preference stays no preference
+		{gpt55, "low", "low"},
+		{gpt55, "xhigh", "xhigh"},
+		{gpt55, "max", "xhigh"}, // gpt-5.5 stops at xhigh
+		{gpt55, "ultra", "xhigh"},
+		{astra, "max", "max"},
+		{astra, "ultra", "max"},
+		{astra, "HIGH", "high"},
+	}
+	for _, c := range cases {
+		if got := c.model.ClampEffort(c.effort); got != c.want {
+			t.Fatalf("%s.ClampEffort(%q) = %q, want %q", c.model.ID, c.effort, got, c.want)
+		}
+	}
+}

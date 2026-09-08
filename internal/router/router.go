@@ -135,9 +135,10 @@ func (r *Router) serveMessages(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	effort := resolveEffort(body.JSON, resolution)
 	logx.Infof("codex messages model=%s -> %s effort=%s (%s body)",
-		model, resolution.Model.ID, effortOrDefault(resolution), bodyEncodingLabel(body))
-	r.serveCodexMessages(w, req, body.JSON, resolution)
+		model, resolution.Model.ID, effort, bodyEncodingLabel(body))
+	r.serveCodexMessages(w, req, body.JSON, resolution, effort)
 }
 
 // serveCountTokens answers token counts for Codex models locally and lets
@@ -194,13 +195,6 @@ func bodyEncodingLabel(body *requestBody) string {
 		return "identity"
 	}
 	return body.Encoding
-}
-
-func effortOrDefault(resolution codex.Resolution) string {
-	if resolution.Effort != "" {
-		return resolution.Effort
-	}
-	return "auto"
 }
 
 // writeAnthropicError renders an error in the shape Anthropic clients expect.

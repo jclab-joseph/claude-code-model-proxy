@@ -331,23 +331,46 @@ gpt-5.6-sol-high
 # proxy: codex messages model=gpt-5.6-sol-high -> gpt-5.6-sol effort=high
 ```
 
-## Model names
+## Model names and effort
 
-Every Codex model is accepted under several spellings:
+Every model is accepted under several spellings:
 
 | Name | Meaning |
 | --- | --- |
-| `gpt-5.5` | the model at its default reasoning effort |
-| `gpt-5.5-high` | an effort variant (`low`, `medium`, `high`, `xhigh`, `max`) |
+| `gpt-5.5` | the model, with the effort the client asks for |
+| `gpt-5.5-high` | pins the effort to `high`, overriding the client |
 | `gpt-5.5:high` | the same, colon separated |
 | `codex/gpt-5.5-high` | with a namespace prefix |
+| `gpt-5.5[1m]` | Claude Code's context-window suffix, ignored |
 
-An effort the model does not support is clamped down to its highest supported
-level rather than being rejected. Which models your account may actually use
-depends on your ChatGPT plan, so a listed model can still be refused upstream.
+**Reasoning effort is Claude Code's own control, not a model name.** `/effort`
+and `--effort` send the choice with the request as `output_config.effort`, and
+the proxy maps it onto the Codex `reasoning.effort`, so one picker row per
+model is enough:
 
-Set `codex.effort_variants` to `false` to advertise only the bare ids, or
-`codex.models` to a list to restrict the catalog.
+```
+--effort high   →  output_config.effort=high   →  reasoning.effort=high
+--effort low    →  output_config.effort=low    →  reasoning.effort=low
+(unset)         →  output_config.effort=medium →  reasoning.effort=medium
+```
+
+Claude Code remembers the last effort you chose, so a run with no `--effort`
+still sends one; the proxy forwards whatever arrives rather than second
+guessing it. Token counting ignores effort, since it does not affect the
+prompt.
+
+Claude Code offers the effort levels of the model a picker row *behaves as*,
+which can exceed the real model's range, so the value is clamped: `max` on
+`gpt-5.5` (which stops at `xhigh`) becomes `xhigh`, and Claude Code's `ultra`
+becomes the highest level the model has.
+
+A name that pins the effort still works and wins over the client's choice.
+Those per-effort ids are **not** advertised by default — they would multiply
+the picker rows for something Claude Code already controls. Set
+`codex.effort_variants` to `true` to list them, which is worth doing for a
+client that has no effort control of its own.
+
+Set `codex.models` to a list to restrict the catalog.
 
 ## Credentials
 
@@ -428,7 +451,7 @@ the easiest starting point.
     "user_agent": "codex-tui/...",
     "originator": "codex-tui",
     "models": [],
-    "effort_variants": true,
+    "effort_variants": false,
     "model_prefix": "",
     "callback_port": 1455,
     "auth_file": "",
@@ -525,6 +548,9 @@ The suite runs the whole path without network access:
 - The resolver against a DNS server the test starts itself: UDP, the TCP
   retry on truncation, TTL caching, server failover, and the refusal to dial
   the proxy's own listener.
+- Effort handling: that the client's `output_config.effort` reaches the Codex
+  backend, that it is clamped to the levels the real model has, and that an
+  effort pinned in the model name overrides it.
 - Compressed request bodies: that a gzipped or deflated request for an added
   model is routed to it, that pass-through keeps the original bytes and
   coding, that a rewritten body drops the coding, and that an undecodable or

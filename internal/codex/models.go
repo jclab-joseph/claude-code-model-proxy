@@ -257,6 +257,16 @@ func (r *Registry) Resolve(name string) (Resolution, bool) {
 	return Resolution{}, false
 }
 
+// ClampEffort keeps a requested reasoning level only when this model supports
+// it, otherwise returning the closest level it does. An empty effort stays
+// empty, meaning "no preference".
+//
+// Claude Code offers effort levels based on the model its picker row says to
+// behave as, which can be a level the real model does not have.
+func (m Model) ClampEffort(effort string) string {
+	return normalizeEffort(m, effort)
+}
+
 // normalizeEffort keeps a requested level only when the model supports it,
 // falling back to the closest supported level.
 func normalizeEffort(model Model, effort string) string {

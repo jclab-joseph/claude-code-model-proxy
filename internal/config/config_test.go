@@ -422,3 +422,25 @@ func TestDefaultsAreAlreadyAbsolute(t *testing.T) {
 		}
 	}
 }
+
+func TestEffortVariantsAreOffByDefault(t *testing.T) {
+	// Claude Code picks effort itself and sends it with the request, so a
+	// row per effort would only multiply the picker entries.
+	if Default().Codex.EffortVariants {
+		t.Fatal("codex.effort_variants must default to false")
+	}
+}
+
+func TestEffortVariantsCanBeEnabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"listen_http":"127.0.0.1:1","codex":{"effort_variants":true}}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Codex.EffortVariants {
+		t.Fatal("an explicit true must be honoured")
+	}
+}

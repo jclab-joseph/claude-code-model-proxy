@@ -483,3 +483,154 @@ func TestCodexStreamErrorMidStream(t *testing.T) {
 		t.Fatalf("error.message = %q", got)
 	}
 }
+
+// codexUpstream returns the body the Codex backend received.
+func (h *harness) codexUpstream(t *testing.T) gjson.Result {
+	t.Helper()
+	if h.codex.body == "" {
+		t.Fatal("the Codex backend received no request")
+	}
+	return gjson.Parse(h.codex.body)
+}
+
+func TestClientEffortIsForwarded(t *testing.T) {
+	// This is how Claude Code's /effort and --effort arrive, so a bare model
+	// id is enough to control effort; per-effort ids are not needed.
+	for _, effort := range []string{"low", "medium", "high", "xhigh"} {
+		h := newHarness(t, nil, nil, true)
+		h.do(t, http.MethodPost, "/v1/messages", `{
+			"model":"gpt-5.5",
+			"max_tokens":100,
+			"messages":[{"role":"user","content":"hi"}],
+			"thinking":{"type":"adaptive"},
+			"output_config":{"effort":"`+effort+`"}
+		}`)
+		if got := h.codexUpstream(t).Get("reasoning.effort").String(); got != effort {
+			t.Fatalf("output_config.effort %q became reasoning.effort %q", effort, got)
+		}
+	}
+}
+
+func TestClientEffortIsClampedToWhatTheModelSupports(t *testing.T) {
+	// Claude Code offers the effort levels of the model the picker row says
+	// to behave as, which can exceed the real model's range.
+	h := newHarness(t, nil, nil, true)
+	h.do(t, http.MethodPost, "/v1/messages", `{
+		"model":"gpt-5.5",
+		"messages":[],
+		"output_config":{"effort":"max"}
+	}`)
+	// gpt-5.5 stops at xhigh.
+	if got := h.codexUpstream(t).Get("reasoning.effort").String(); got != "xhigh" {
+		t.Fatalf("reasoning.effort = %q, want it clamped to xhigh", got)
+	}
+
+	// A model that does support max passes it through.
+	h = newHarness(t, nil, nil, true)
+	h.do(t, http.MethodPost, "/v1/messages", `{
+		"model":"gpt-6-astra",
+		"messages":[],
+		"output_config":{"effort":"max"}
+	}`)
+	if got := h.codexUpstream(t).Get("reasoning.effort").String(); got != "max" {
+		t.Fatalf("reasoning.effort = %q, want max", got)
+	}
+}
+
+func TestUnknownClientEffortIsClamped(t *testing.T) {
+	// "ultra" exists in Claude Code but in no Codex model.
+	h := newHarness(t, nil, nil, true)
+	h.do(t, http.MethodPost, "/v1/messages", `{
+		"model":"gpt-6-astra",
+		"messages":[],
+		"output_config":{"effort":"ultra"}
+	}`)
+	if got := h.codexUpstream(t).Get("reasoning.effort").String(); got != "max" {
+		t.Fatalf("reasoning.effort = %q, want the highest supported level", got)
+	}
+}
+
+func TestModelNameEffortOverridesTheClient(t *testing.T) {
+	// A per-effort id is still honoured, and is an explicit override.
+	h := newHarness(t, nil, nil, true)
+	h.do(t, http.MethodPost, "/v1/messages", `{
+		"model":"gpt-5.5-low",
+		"messages":[],
+		"output_config":{"effort":"high"}
+	}`)
+	if got := h.codexUpstream(t).Get("reasoning.effort").String(); got != "low" {
+		t.Fatalf("reasoning.effort = %q, want the model name to win", got)
+	}
+}
+
+func TestEffortFallsBackWithoutAnyClientPreference(t *testing.T) {
+	h := newHarness(t, nil, nil, true)
+	h.do(t, http.MethodPost, "/v1/messages", `{"model":"gpt-5.5","messages":[]}`)
+	if got := h.codexUpstream(t).Get("reasoning.effort").String(); got != "medium" {
+		t.Fatalf("reasoning.effort = %q, want the model default", got)
+	}
+}
+
+func TestResolveEffortAlwaysReturnsAConcreteLevel(t *testing.T) {
+	registry := codex.NewRegistry(nil, "", true)
+	resolve := func(model, body string) string {
+		resolution, ok := registry.Resolve(model)
+		if !ok {
+			t.Fatalf("%q is not a Codex model", model)
+		}
+		return resolveEffort([]byte(body), resolution)
+	}
+
+	cases := []struct {
+		name  string
+		model string
+		body  string
+		want  string
+	}{
+		{"model default", "gpt-5.5", `{}`, "medium"},
+		{"client choice", "gpt-5.5", `{"output_config":{"effort":"high"}}`, "high"},
+		{"model name pin", "gpt-5.5-low", `{"output_config":{"effort":"high"}}`, "low"},
+		{"clamped client choice", "gpt-5.5", `{"output_config":{"effort":"max"}}`, "xhigh"},
+		{"thinking budget", "gpt-5.5", `{"thinking":{"type":"enabled","budget_tokens":40000}}`, "xhigh"},
+		{"thinking disabled", "gpt-5.5", `{"thinking":{"type":"disabled"}}`, "low"},
+		{"adaptive with no effort", "gpt-5.5", `{"thinking":{"type":"adaptive"}}`, "xhigh"},
+		{"unparseable body", "gpt-5.5", `not json`, "medium"},
+	}
+	for _, c := range cases {
+		got := resolve(c.model, c.body)
+		if got != c.want {
+			t.Fatalf("%s: resolveEffort = %q, want %q", c.name, got, c.want)
+		}
+		// An empty result would silently hand the decision to a second
+		// place, which is the bug this consolidation removes.
+		if got == "" {
+			t.Fatalf("%s: resolveEffort returned no level", c.name)
+		}
+	}
+}
+
+func TestTheEffortSentUpstreamIsTheOneResolved(t *testing.T) {
+	registry := codex.NewRegistry(nil, "", true)
+
+	for _, body := range []string{
+		`{"model":"gpt-5.5","messages":[]}`,
+		`{"model":"gpt-5.5","messages":[],"output_config":{"effort":"high"}}`,
+		`{"model":"gpt-5.5","messages":[],"output_config":{"effort":"max"}}`,
+		`{"model":"gpt-5.5-low","messages":[],"output_config":{"effort":"high"}}`,
+		`{"model":"gpt-6-astra","messages":[],"output_config":{"effort":"ultra"}}`,
+		`{"model":"gpt-5.5","messages":[],"thinking":{"type":"enabled","budget_tokens":2048}}`,
+	} {
+		model := gjson.Get(body, "model").String()
+		resolution, ok := registry.Resolve(model)
+		if !ok {
+			t.Fatalf("%q is not a Codex model", model)
+		}
+		want := resolveEffort([]byte(body), resolution)
+
+		h := newHarness(t, nil, nil, true)
+		h.do(t, http.MethodPost, "/v1/messages", body)
+		if got := h.codexUpstream(t).Get("reasoning.effort").String(); got != want {
+			t.Fatalf("%s: sent reasoning.effort %q but resolveEffort said %q", body, got, want)
+		}
+	}
+}
