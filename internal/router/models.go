@@ -20,7 +20,7 @@ var codexModelCreatedAt = time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 // serveModels answers the model list with the upstream catalog plus the models
 // this proxy adds.
 func (r *Router) serveModels(w http.ResponseWriter, req *http.Request) {
-	upstreamBody, upstreamStatus, upstreamHeader, err := r.fetchUpstreamModels(req)
+	upstreamBody, upstreamStatus, upstreamHeader, err := r.fetchUpstream(req, http.MethodGet)
 
 	// Pagination cursors mean this is not the first page; extending it would
 	// duplicate entries, so such pages are passed through as they are.
@@ -109,14 +109,15 @@ func displayNameFor(registry *codex.Registry, id string) string {
 	return resolution.Model.DisplayName + " · " + resolution.Effort
 }
 
-// fetchUpstreamModels forwards the client's list request to Anthropic.
-func (r *Router) fetchUpstreamModels(req *http.Request) (body []byte, status int, header http.Header, err error) {
+// fetchUpstream forwards a bodyless request to the upstream API and buffers
+// the response, so the proxy can inspect and rewrite it.
+func (r *Router) fetchUpstream(req *http.Request, method string) (body []byte, status int, header http.Header, err error) {
 	target := r.upstream.String() + req.URL.Path
 	if req.URL.RawQuery != "" {
 		target += "?" + req.URL.RawQuery
 	}
 
-	outbound, err := http.NewRequestWithContext(req.Context(), http.MethodGet, target, nil)
+	outbound, err := http.NewRequestWithContext(req.Context(), method, target, nil)
 	if err != nil {
 		return nil, 0, nil, err
 	}

@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -9,11 +10,18 @@ import (
 type Model struct {
 	ID             string
 	DisplayName    string
+	Description    string
 	ContextLength  int
 	MaxOutput      int
 	ReasoningLevel []string
 	DefaultEffort  string
 	SupportsImages bool
+	// BehavesAs names the Claude model whose client-side handling Claude
+	// Code should apply to this one. It is required for a `modelPicker` row:
+	// a row naming a model the installed version does not know is not
+	// offered without it. The value only affects the client's own prompt
+	// profile and effort defaults; the model id sent upstream is unchanged.
+	BehavesAs string
 }
 
 // Catalog is the set of Codex models reachable with a ChatGPT subscription.
@@ -24,58 +32,74 @@ var Catalog = []Model{
 	{
 		ID:             "gpt-5.6-sol",
 		DisplayName:    "GPT-5.6 Sol (Codex)",
+		Description:    "Frontier coding and research model. Capable at low effort; turn it up for harder work.",
 		ContextLength:  372000,
 		MaxOutput:      128000,
 		ReasoningLevel: []string{"low", "medium", "high", "xhigh", "max"},
 		DefaultEffort:  "medium",
 		SupportsImages: true,
+		BehavesAs:      "claude-opus-5",
 	},
 	{
 		ID:             "gpt-6-astra",
 		DisplayName:    "GPT-6 Astra (Codex)",
+		Description:    "OpenAI's most intelligent model: computer use, browsing and software engineering.",
 		ContextLength:  272000,
 		MaxOutput:      128000,
 		ReasoningLevel: []string{"low", "medium", "high", "xhigh", "max"},
 		DefaultEffort:  "medium",
 		SupportsImages: true,
+		BehavesAs:      "claude-opus-5",
 	},
 	{
 		ID:             "gpt-5.6-terra",
 		DisplayName:    "GPT-5.6 Terra (Codex)",
+		Description:    "Frontier model for complex, long-running work.",
 		ContextLength:  372000,
 		MaxOutput:      128000,
 		ReasoningLevel: []string{"low", "medium", "high", "xhigh", "max"},
 		DefaultEffort:  "medium",
 		SupportsImages: true,
+		BehavesAs:      "claude-opus-5",
 	},
 	{
 		ID:             "gpt-5.6-luna",
 		DisplayName:    "GPT-5.6 Luna (Codex)",
+		Description:    "Frontier model for complex, long-running work.",
 		ContextLength:  372000,
 		MaxOutput:      128000,
 		ReasoningLevel: []string{"low", "medium", "high", "xhigh", "max"},
 		DefaultEffort:  "medium",
 		SupportsImages: true,
+		BehavesAs:      "claude-opus-5",
 	},
 	{
 		ID:             "gpt-5.5",
 		DisplayName:    "GPT-5.5 (Codex)",
+		Description:    "Frontier model for complex coding, research and real-world work.",
 		ContextLength:  272000,
 		MaxOutput:      128000,
 		ReasoningLevel: []string{"low", "medium", "high", "xhigh"},
 		DefaultEffort:  "medium",
 		SupportsImages: true,
+		BehavesAs:      "claude-sonnet-5",
 	},
 	{
 		ID:             "gpt-5.3-codex-spark",
 		DisplayName:    "GPT-5.3 Codex Spark",
+		Description:    "Ultra-fast coding model for quick edits.",
 		ContextLength:  128000,
 		MaxOutput:      128000,
 		ReasoningLevel: []string{"low", "medium", "high", "xhigh"},
 		DefaultEffort:  "medium",
 		SupportsImages: false,
+		BehavesAs:      "claude-haiku-4-5",
 	},
 }
+
+// contextWindowSuffix matches the [1m]/[2m] context-window hint Claude Code
+// accepts on a model name.
+var contextWindowSuffix = regexp.MustCompile(`\[[12]m\]$`)
 
 // efforts lists every reasoning level the Responses API accepts, longest first
 // so suffix matching prefers "xhigh" over "high".
@@ -195,6 +219,10 @@ func (r *Registry) Resolve(name string) (Resolution, bool) {
 		return Resolution{}, false
 	}
 	candidate := strings.ToLower(requested)
+	// Claude Code lets a user append [1m] or [2m] to ask for a larger
+	// context window. The suffix is a client-side hint and is not part of
+	// any upstream model id, so it is stripped before matching.
+	candidate = contextWindowSuffix.ReplaceAllString(candidate, "")
 
 	if r.prefix != "" {
 		candidate = strings.TrimPrefix(candidate, r.prefix)
@@ -256,6 +284,81 @@ func normalizeEffort(model Model, effort string) string {
 		return best
 	}
 	return model.DefaultEffort
+}
+
+// PickerRow is one entry of the `modelPicker.options` array in Claude Code's
+// settings.json. The field names and semantics are Claude Code's, not this
+// proxy's.
+type PickerRow struct {
+	// Model is the id to send, taken verbatim; the same value --model takes.
+	Model string `json:"model"`
+	// Label is the row title, Description its subtitle.
+	Label       string `json:"label,omitempty"`
+	Description string `json:"description,omitempty"`
+	// BehavesAs names a model the installed Claude Code knows, whose
+	// client-side handling applies. Without it a row for an unknown model
+	// is not offered at all.
+	BehavesAs string `json:"behavesAs,omitempty"`
+}
+
+// PickerOptions renders one settings.json picker row per advertised model.
+func (r *Registry) PickerOptions() []PickerRow {
+	ids := r.AdvertisedIDs()
+	rows := make([]PickerRow, 0, len(ids))
+	for _, id := range ids {
+		resolution, ok := r.Resolve(id)
+		if !ok {
+			continue
+		}
+		label := resolution.Model.DisplayName
+		description := resolution.Model.Description
+		if resolution.Effort != "" {
+			// The effort is part of the id, so it belongs in the label the
+			// user picks from.
+			label = label + " · " + resolution.Effort
+			description = strings.TrimSuffix(description, ".") + ". Reasoning effort: " + resolution.Effort + "."
+		}
+		rows = append(rows, PickerRow{
+			Model:       id,
+			Label:       label,
+			Description: description,
+			BehavesAs:   resolution.Model.BehavesAs,
+		})
+	}
+	return rows
+}
+
+// BootstrapOption is one entry of the `additional_model_options` array in the
+// Claude Code bootstrap response. The field names are Claude Code's.
+type BootstrapOption struct {
+	Model          string  `json:"model"`
+	Name           string  `json:"name"`
+	Description    string  `json:"description"`
+	DisabledReason *string `json:"disabled_reason"`
+}
+
+// BootstrapOptions renders one bootstrap model option per advertised model.
+func (r *Registry) BootstrapOptions() []BootstrapOption {
+	rows := r.PickerOptions()
+	options := make([]BootstrapOption, 0, len(rows))
+	for _, row := range rows {
+		name := row.Label
+		if name == "" {
+			name = row.Model
+		}
+		description := row.Description
+		if description == "" {
+			// The field is required by the client's schema, and a response
+			// that fails validation would break more than it fixes.
+			description = "Added by claude-code-model-proxy."
+		}
+		options = append(options, BootstrapOption{
+			Model:       row.Model,
+			Name:        name,
+			Description: description,
+		})
+	}
+	return options
 }
 
 // Lookup returns the catalog entry for an exact id.

@@ -106,6 +106,16 @@ type Config struct {
 	// LogLevel is one of debug, info, warn, error.
 	LogLevel string `json:"log_level"`
 
+	// ExperimentalModifyBootstrapModels makes the proxy add its models to
+	// Claude Code's startup response, so they appear in the /model picker
+	// with no client-side configuration.
+	//
+	// It is off by default and enabled only by the
+	// --experimental-modify-bootstrap-models flag: it rewrites an
+	// undocumented Claude Code response rather than a published Anthropic
+	// API one, and the shape can change with any Claude Code release.
+	ExperimentalModifyBootstrapModels bool `json:"-"`
+
 	Codex Codex `json:"codex"`
 	DNS   DNS   `json:"dns"`
 

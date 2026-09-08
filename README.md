@@ -5,8 +5,9 @@ Adds extra models to Claude Code by proxying the Anthropic API.
 All traffic is forwarded to `api.anthropic.com` exactly as it arrives, with two
 exceptions:
 
-1. **`GET /v1/models`** — the upstream catalog is returned with the added models
-   appended, so they appear in Claude Code's `/model` picker.
+1. **`GET /v1/models`** — the upstream catalog is returned with the added
+   models appended. Note that this endpoint does *not* drive Claude Code's
+   `/model` picker; see [Making the models appear in `/model`](#making-the-models-appear-in-model).
 2. **Requests naming an added model** — these are translated and sent to that
    model's own provider instead of Anthropic.
 
@@ -120,8 +121,19 @@ To make it permanent instead, put the same values in `~/.claude/settings.json`:
 }
 ```
 
-**4. Pick a model** with `/model gpt-5.6-sol` (or `/model gpt-5.5-high`) inside
-Claude Code, or list what is on offer with `./ccmproxy models`.
+**4. Put the models in the `/model` picker.** Claude Code builds that list
+from its own catalog, not from the API, so it needs one client-side setting:
+
+```sh
+./ccmproxy models --settings-json > /tmp/picker.json
+jq -s '.[0] * .[1]' ~/.claude/settings.json /tmp/picker.json > /tmp/merged.json
+mv /tmp/merged.json ~/.claude/settings.json
+```
+
+Restart Claude Code and open `/model`. See
+[Making the models appear in `/model`](#making-the-models-appear-in-model) for
+why this is needed and for the alternative that needs no client setting.
+`./ccmproxy models` lists what is on offer.
 
 ### The certificate authority
 
@@ -199,6 +211,108 @@ Check what the proxy sees with:
 Setting `dns.enabled` to `false` falls back to the operating system resolver,
 which is only safe when nothing redirects the intercepted hosts.
 
+## Making the models appear in `/model`
+
+Claude Code's `/model` picker is **not** built from `GET /v1/models`. Verified
+against Claude Code 2.1.263 by logging every request of a full session: that
+endpoint is fetched zero times. The picker is Claude Code's own model catalog
+plus two lists it is given:
+
+- `additional_model_options` in the `GET /api/claude_cli/bootstrap` response —
+  this is how Anthropic itself adds a model (that is where the `Fable` row
+  comes from), and
+- `modelPicker.options` in `settings.json`.
+
+There *is* a `/v1/models` discovery path in the binary, but it cannot work
+here, for two independent reasons:
+
+```js
+// it only runs when the base URL points somewhere that is NOT the real API
+function Qv(){ let e=process.env.ANTHROPIC_BASE_URL; if(!e) return true; return Gw(e) }
+function Gw(e){ return ["api.anthropic.com"].includes(new URL(e).host) }
+function Dp(){ …; if(po()) return false; if(!a.ANTHROPIC_BASE_URL) return false; … }
+
+// and it drops every id that is not Anthropic's
+.filter((c) => /(claude|anthropic)/i.test(c.id))
+```
+
+The first condition is the opposite of what this proxy does — it keeps
+`api.anthropic.com` and intercepts it — and the second would discard `gpt-5.5`
+anyway. So the model list is still merged for correctness and for other
+clients (`curl`, the SDKs), but it is not what makes the picker work.
+
+### Option 1: `modelPicker` in settings.json (recommended)
+
+```sh
+./ccmproxy models --settings-json
+```
+
+emits a ready-to-merge block:
+
+```json
+{
+  "modelPicker": {
+    "options": [
+      {
+        "model": "gpt-5.6-sol",
+        "label": "GPT-5.6 Sol (Codex)",
+        "description": "Frontier coding and research model. …",
+        "behavesAs": "claude-opus-5"
+      }
+    ]
+  }
+}
+```
+
+`behavesAs` is required, not decoration: it names a model the installed Claude
+Code knows, whose client-side handling — prompt profile, capability and effort
+defaults — is applied. Without it, *a row for a model this version does not
+know is not offered at all*, and selecting the model prints
+
+```
+"gpt-5.5" isn't described by this version's model catalog …
+```
+
+The model id sent upstream is unchanged; only the client's own assumptions
+come from `behavesAs`. Add `"replaceBuiltInOptions": true` to show *only* these
+rows, and see `./ccmproxy models` for the mapping each model uses.
+
+The context window Claude Code assumes comes from `behavesAs` too, so a model
+with a larger one is compacted earlier than it needs to be. Either append
+`[1m]` to the model name (the proxy strips the suffix before routing) or set
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real window.
+
+### Option 2: `--experimental-modify-bootstrap-models`
+
+```sh
+./ccmproxy serve --experimental-modify-bootstrap-models
+```
+
+The proxy then appends its models to `additional_model_options` in the
+`/api/claude_cli/bootstrap` response, so they show up with **no client-side
+configuration at all** — which is what makes it worth having when handing the
+proxy to a teammate.
+
+It is experimental and off by default because it rewrites an undocumented
+Claude Code response rather than a published Anthropic API one, and the shape
+can change with any release. The implementation is deliberately timid: a
+response that is still compressed, is not JSON, carries an unexpected
+`additional_model_options` shape, or came back non-2xx is forwarded untouched,
+and a model the account already offers is never duplicated. A broken bootstrap
+response would take out much more than the model picker.
+
+**The two options are complementary, and using both is the best setup.**
+Bootstrap injection supplies the rows but does not make Claude Code *know* the
+models, so on its own it still prints the model-catalog warning and assumes a
+200k window. `behavesAs` is what clears that. With both in place:
+
+```
+$ claude --model gpt-5.6-sol-high -p "Reply with just your model name."
+gpt-5.6-sol-high
+# proxy: bootstrap: added 28 models to the /model picker
+# proxy: codex messages model=gpt-5.6-sol-high -> gpt-5.6-sol effort=high
+```
+
 ## Model names
 
 Every Codex model is accepted under several spellings:
@@ -249,10 +363,15 @@ Set `codex.use_codex_cli_auth` to `false` to ignore the CLI's file entirely.
 
 ```
 ccmproxy serve                run the proxy (default command)
+  --experimental-modify-bootstrap-models
+                              also add the models to Claude Code's startup
+                              response, so /model lists them with no
+                              settings.json change
 ccmproxy login codex          sign in to a ChatGPT account
 ccmproxy logout codex         remove the stored credentials
 ccmproxy status               configuration, CA path and login state
 ccmproxy models               the models this proxy adds
+ccmproxy models --settings-json   a modelPicker block for settings.json
 ccmproxy ca [--export path]   print or export the CA certificate
 ccmproxy env [--shell fish]   the environment Claude Code needs
 ccmproxy dns HOST...          resolve names with the internal resolver
@@ -342,6 +461,20 @@ Non-streaming requests go through the same translator and are then folded back
 into one message, since the Codex backend only serves streaming responses and
 does not repeat the output items in its terminal event.
 
+### Compressed request bodies
+
+Claude Code gzips request bodies once they grow past a threshold, so most real
+sessions arrive as `Content-Encoding: gzip`. The router decodes the body to
+read the model name — otherwise every large request would look like one for an
+unknown model and be sent to Anthropic regardless of what was selected.
+
+Pass-through still forwards the **original compressed bytes** and the client's
+`Content-Encoding` untouched; only a body the proxy has to rewrite is sent
+decoded, with the coding header dropped. `gzip` and `deflate` are decoded;
+anything else (a request under `br` or `zstd`, or a corrupt stream) is
+forwarded untouched with a warning, since a request that cannot be inspected
+can still be proxied.
+
 ### Two deliberate deviations from byte-exact pass-through
 
 - **`/v1/messages/count_tokens` for an added model** is answered locally with a
@@ -374,6 +507,15 @@ The suite runs the whole path without network access:
 - The resolver against a DNS server the test starts itself: UDP, the TCP
   retry on truncation, TTL caching, server failover, and the refusal to dial
   the proxy's own listener.
+- Compressed request bodies: that a gzipped or deflated request for an added
+  model is routed to it, that pass-through keeps the original bytes and
+  coding, that a rewritten body drops the coding, and that an undecodable or
+  corrupt body is forwarded byte for byte.
+- Bootstrap rewriting against a copy of the real response: that the account's
+  own entries survive and are never duplicated, that every field the client's
+  schema requires is present, that a null or absent option list is handled,
+  and that a compressed, non-JSON, misshapen or failed response is forwarded
+  byte for byte instead.
 
 ## Security notes
 

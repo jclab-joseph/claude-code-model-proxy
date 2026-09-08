@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -20,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -38,19 +40,32 @@ const usage = `ccmproxy - add models to Claude Code by proxying the Anthropic AP
 
 Usage:
   ccmproxy serve [flags]        run the proxy (default command)
+      --experimental-modify-bootstrap-models
+                                also add the models to Claude Code's startup
+                                response, so /model lists them with no
+                                settings.json change
   ccmproxy login codex [flags]  sign in to a ChatGPT account for Codex models
   ccmproxy logout codex         remove the stored Codex credentials
   ccmproxy status               show configuration, CA path and login state
-  ccmproxy models               list the models this proxy adds
+  ccmproxy models [--settings-json]
+                                list the models this proxy adds;
+                                --settings-json prints a modelPicker block
+                                to merge into Claude Code's settings.json
   ccmproxy ca [--export path]   print or export the local CA certificate
   ccmproxy env [--shell fish]   print the environment Claude Code needs
   ccmproxy dns HOST...          resolve names with the internal resolver
   ccmproxy config init          write a config file with the current defaults
+  ccmproxy version              print the version and build details
 
 Common flags:
   --config PATH   configuration file (default %s)
   --log LEVEL     debug, info, warn or error
 `
+
+// version is the release this binary was built from. It is stamped at build
+// time with -ldflags "-X main.version=..."; a build without that reports
+// "dev", which is what a local `go build` produces.
+var version = "dev"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -60,6 +75,12 @@ func main() {
 }
 
 func run(args []string) error {
+	// --version is handled before the command dispatch, which would
+	// otherwise read a leading flag as an argument to `serve`.
+	if len(args) == 1 && (args[0] == "--version" || args[0] == "-version" || args[0] == "-v") {
+		return runVersion()
+	}
+
 	command := "serve"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		command, args = args[0], args[1:]
@@ -84,6 +105,8 @@ func run(args []string) error {
 		return runDNS(args)
 	case "config":
 		return runConfig(args)
+	case "version":
+		return runVersion()
 	case "help", "-h", "--help":
 		fmt.Printf(usage, config.DefaultPath())
 		return nil
@@ -177,11 +200,14 @@ func directTransport(dial dialer) *http.Transport {
 }
 
 func runServe(args []string) error {
-	var noProxy, noTLS, noHTTP bool
+	var noProxy, noTLS, noHTTP, modifyBootstrap bool
 	cfg, _, err := commonFlags("serve", args, func(fs *flag.FlagSet) {
 		fs.BoolVar(&noProxy, "no-proxy-listener", false, "do not start the HTTP CONNECT proxy")
 		fs.BoolVar(&noTLS, "no-tls-listener", false, "do not start the direct TLS listener")
 		fs.BoolVar(&noHTTP, "no-http-listener", false, "do not start the plain HTTP listener")
+		fs.BoolVar(&modifyBootstrap, "experimental-modify-bootstrap-models", false,
+			"add the models to Claude Code's startup response so they appear in /model "+
+				"without editing settings.json (rewrites an undocumented response)")
 	})
 	if err != nil {
 		return err
@@ -198,6 +224,7 @@ func runServe(args []string) error {
 	if noHTTP {
 		cfg.ListenHTTP = ""
 	}
+	cfg.ExperimentalModifyBootstrapModels = modifyBootstrap
 
 	// Stored material is reused so the trust anchor survives restarts; the
 	// root key is discarded whenever new material has to be created.
@@ -240,6 +267,10 @@ func runServe(args []string) error {
 	}
 	logx.Infof("upstream: %s", cfg.Upstream)
 	logx.Infof("intercepting: %s", strings.Join(cfg.InterceptHosts, ", "))
+	if cfg.ExperimentalModifyBootstrapModels {
+		logx.Warnf("experimental: rewriting %s to add %d models to the /model picker",
+			"/api/claude_cli/bootstrap", len(registry.BootstrapOptions()))
+	}
 	if resolver != nil {
 		logx.Infof("dns: resolving upstream names with %s", strings.Join(resolver.Servers(), ", "))
 	} else {
@@ -436,13 +467,27 @@ func runStatus(args []string) error {
 }
 
 func runModels(args []string) error {
-	cfg, _, err := commonFlags("models", args, nil)
+	var settingsJSON, bootstrapJSON bool
+	cfg, _, err := commonFlags("models", args, func(fs *flag.FlagSet) {
+		fs.BoolVar(&settingsJSON, "settings-json", false,
+			"print a modelPicker block to merge into Claude Code's settings.json")
+		fs.BoolVar(&bootstrapJSON, "bootstrap-json", false,
+			"print the additional_model_options this proxy injects into the bootstrap response")
+	})
 	if err != nil {
 		return err
 	}
 	registry := codex.NewRegistry(cfg.Codex.Models, cfg.Codex.ModelPrefix, cfg.Codex.EffortVariants)
-	for _, id := range registry.AdvertisedIDs() {
-		resolution, ok := registry.Resolve(id)
+
+	switch {
+	case settingsJSON:
+		return printSettingsJSON(registry)
+	case bootstrapJSON:
+		return printJSON(map[string]any{"additional_model_options": registry.BootstrapOptions()})
+	}
+
+	for _, row := range registry.PickerOptions() {
+		resolution, ok := registry.Resolve(row.Model)
 		if !ok {
 			continue
 		}
@@ -450,7 +495,43 @@ func runModels(args []string) error {
 		if effort == "" {
 			effort = resolution.Model.DefaultEffort + " (default)"
 		}
-		fmt.Printf("%-28s %-24s context %7d  effort %s\n", id, resolution.Model.ID, resolution.Model.ContextLength, effort)
+		fmt.Printf("%-28s %-24s context %7d  effort %-16s behaves as %s\n",
+			row.Model, resolution.Model.ID, resolution.Model.ContextLength, effort, row.BehavesAs)
+	}
+	return nil
+}
+
+// printSettingsJSON emits the settings.json fragment that puts the added
+// models in Claude Code's /model picker.
+//
+// This is the client-side half of the integration and needs no cooperation
+// from the proxy: Claude Code's picker is built from its own catalog plus
+// `modelPicker.options`, and never from the /v1/models endpoint.
+func printSettingsJSON(registry *codex.Registry) error {
+	block := map[string]any{
+		"modelPicker": map[string]any{
+			"options": registry.PickerOptions(),
+		},
+	}
+	if err := printJSON(block); err != nil {
+		return err
+	}
+
+	settingsPath := "~/.claude/settings.json"
+	fmt.Fprintf(os.Stderr, "\n# Merge the block above into %s, for example:\n", settingsPath)
+	fmt.Fprintf(os.Stderr, "#   ccmproxy models --settings-json > /tmp/picker.json\n")
+	fmt.Fprintf(os.Stderr, "#   jq -s '.[0] * .[1]' %s /tmp/picker.json > /tmp/merged.json\n", settingsPath)
+	fmt.Fprintf(os.Stderr, "#   mv /tmp/merged.json %s\n", settingsPath)
+	fmt.Fprintf(os.Stderr, "# Restart Claude Code, then open /model.\n")
+	return nil
+}
+
+func printJSON(value any) error {
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetIndent("", "  ")
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return fmt.Errorf("encode JSON: %w", err)
 	}
 	return nil
 }
@@ -549,6 +630,25 @@ func runDNS(args []string) error {
 	}
 	if failed {
 		return errors.New("one or more names could not be resolved")
+	}
+	return nil
+}
+
+// runVersion reports the build, which matters when a released binary is
+// being compared against a local one.
+func runVersion() error {
+	fmt.Printf("ccmproxy %s\n", version)
+	fmt.Printf("  go       %s\n", runtime.Version())
+	fmt.Printf("  platform %s/%s\n", runtime.GOOS, runtime.GOARCH)
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				fmt.Printf("  revision %s\n", setting.Value)
+			case "vcs.time":
+				fmt.Printf("  built    %s\n", setting.Value)
+			}
+		}
 	}
 	return nil
 }

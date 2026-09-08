@@ -4,10 +4,8 @@
 package router
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -98,6 +96,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case req.Method == http.MethodPost && path == "/v1/messages/count_tokens":
 		r.serveCountTokens(w, req)
 		return
+	case r.cfg.ExperimentalModifyBootstrapModels && req.Method == http.MethodGet && path == bootstrapPath:
+		r.serveBootstrap(w, req)
+		return
 	}
 
 	logx.Debugf("passthrough %s %s", req.Method, path)
@@ -113,23 +114,30 @@ func (r *Router) serveMessages(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	model := gjson.GetBytes(body, "model").String()
+	model := gjson.GetBytes(body.JSON, "model").String()
 	resolution, isCodex := r.registry.Resolve(model)
 	if !isCodex {
+		if model == "" && body.Compressed() && !body.Readable() {
+			// Worth saying out loud: an unreadable body is why a request for
+			// an added model would silently go to Anthropic instead.
+			logx.Warnf("could not read the model from a %s encoded body; routing to %s", body.Encoding, r.cfg.Upstream)
+		}
 		// Reasoning state this proxy issued would be rejected by Anthropic,
 		// so it is dropped when a session switches back to a Claude model.
-		if cleaned, changed := translate.StripProxySignatures(body); changed {
+		if cleaned, changed := translate.StripProxySignatures(body.JSON); changed {
 			logx.Debugf("dropped proxy-issued thinking blocks before passing %s upstream", model)
-			body = cleaned
+			body.forwardModified(req, cleaned)
+		} else {
+			body.forward(req)
 		}
-		restoreBody(req, body)
 		logx.Debugf("passthrough messages model=%s", model)
 		r.proxy.ServeHTTP(w, req)
 		return
 	}
 
-	logx.Infof("codex messages model=%s -> %s effort=%s", model, resolution.Model.ID, effortOrDefault(resolution))
-	r.serveCodexMessages(w, req, body, resolution)
+	logx.Infof("codex messages model=%s -> %s effort=%s (%s body)",
+		model, resolution.Model.ID, effortOrDefault(resolution), bodyEncodingLabel(body))
+	r.serveCodexMessages(w, req, body.JSON, resolution)
 }
 
 // serveCountTokens answers token counts for Codex models locally and lets
@@ -141,17 +149,18 @@ func (r *Router) serveCountTokens(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	model := gjson.GetBytes(body, "model").String()
+	model := gjson.GetBytes(body.JSON, "model").String()
 	if _, isCodex := r.registry.Resolve(model); !isCodex {
-		if cleaned, changed := translate.StripProxySignatures(body); changed {
-			body = cleaned
+		if cleaned, changed := translate.StripProxySignatures(body.JSON); changed {
+			body.forwardModified(req, cleaned)
+		} else {
+			body.forward(req)
 		}
-		restoreBody(req, body)
 		r.proxy.ServeHTTP(w, req)
 		return
 	}
 
-	r.writeCodexTokenCount(w, body)
+	r.writeCodexTokenCount(w, body.JSON)
 }
 
 func (r *Router) serveAdmin(w http.ResponseWriter, req *http.Request) {
@@ -178,29 +187,13 @@ func (r *Router) serveAdmin(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func readBody(req *http.Request) ([]byte, error) {
-	if req.Body == nil {
-		return nil, fmt.Errorf("request has no body")
+// bodyEncodingLabel describes how the client sent the body, which is the
+// detail that decides whether the model name can be read at all.
+func bodyEncodingLabel(body *requestBody) string {
+	if !body.Compressed() {
+		return "identity"
 	}
-	body, err := io.ReadAll(io.LimitReader(req.Body, maxRequestBody+1))
-	_ = req.Body.Close()
-	if err != nil {
-		return nil, fmt.Errorf("read request body: %w", err)
-	}
-	if len(body) > maxRequestBody {
-		return nil, fmt.Errorf("request body exceeds %d bytes", maxRequestBody)
-	}
-	return body, nil
-}
-
-// restoreBody puts a buffered body back on the request so it can be proxied.
-func restoreBody(req *http.Request, body []byte) {
-	req.Body = io.NopCloser(bytes.NewReader(body))
-	req.ContentLength = int64(len(body))
-	req.Header.Del("Content-Length")
-	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
-	// A buffered body is no longer chunked.
-	req.TransferEncoding = nil
+	return body.Encoding
 }
 
 func effortOrDefault(resolution codex.Resolution) string {
