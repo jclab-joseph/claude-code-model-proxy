@@ -1,6 +1,96 @@
 # claude-code-model-proxy (`ccmproxy`)
 
-Adds extra models to Claude Code by proxying the Anthropic API.
+Adds OpenAI **Codex** models to Claude Code, paid for by your ChatGPT
+subscription. They show up in `/model` next to the Claude models, and
+everything else still goes to Anthropic untouched.
+
+![Claude Code's /model picker listing the Codex models alongside the Claude ones](docs/img1.png)
+
+Claude Code needs no `ANTHROPIC_BASE_URL` change and no settings file: the
+proxy answers as `api.anthropic.com` itself, using its own local CA.
+
+## Quick start
+
+Point `api.anthropic.com` at the proxy with `/etc/hosts`. Six steps, Linux
+shown; `sudo` is needed for three of them.
+
+**1. Get the binary.** Download it from the
+[latest release](https://github.com/jclab-joseph/claude-code-model-proxy/releases/latest),
+or build it:
+
+```sh
+go build -o ccmproxy ./cmd/ccmproxy
+```
+
+**2. Sign in to ChatGPT.** Skip this if you already use the Codex CLI —
+`~/.codex/auth.json` is picked up as it is.
+
+```sh
+./ccmproxy login codex
+```
+
+**3. Serve TLS on a loopback address of its own.** Any `127.x.x.x` works and
+leaves `127.0.0.1:443` free for anything else.
+
+```sh
+mkdir -p ~/.config/ccmproxy
+cat > ~/.config/ccmproxy/config.json <<'JSON'
+{
+  "listen_tls": "127.1.0.101:443"
+}
+JSON
+```
+
+**4. Allow it to bind port 443 without running as root.**
+
+```sh
+sudo setcap cap_net_bind_service=+ep ./ccmproxy
+```
+
+**5. Trust the CA.** The certificate is created on demand and then reused, so
+this is a one-time step.
+
+```sh
+./ccmproxy ca --export /tmp/ccmproxy-ca.crt
+sudo cp /tmp/ccmproxy-ca.crt /usr/local/share/ca-certificates/ccmproxy-ca.crt
+sudo update-ca-certificates
+```
+
+**6. Start the proxy, then redirect the hostname.**
+
+```sh
+./ccmproxy serve --experimental-modify-bootstrap-models
+
+# in another terminal
+echo '127.1.0.101 api.anthropic.com' | sudo tee -a /etc/hosts
+```
+
+Restart Claude Code and open `/model`: the Codex models are in the list.
+Reasoning effort is Claude Code's own control — `/effort` or `--effort`.
+
+To turn the whole thing off, delete that `/etc/hosts` line. Nothing else on the
+machine has to change.
+
+### Notes on those steps
+
+- **`./run.sh`** does steps 1, 4 and 6 for you: it builds, grants the
+  capability, adds the `/etc/hosts` line, starts the proxy, and takes the
+  line back out when you stop it with Ctrl-C.
+- **`--experimental-modify-bootstrap-models`** is what puts the models in the
+  picker. It rewrites Claude Code's startup response, which is undocumented
+  and can change with any release — hence the flag. The stable alternative is
+  a `modelPicker` block in `settings.json`; see
+  [Making the models appear in `/model`](#making-the-models-appear-in-model).
+- **Trusting the CA system-wide** also makes `curl` and other tools work. If
+  you would rather not touch the system store, set
+  `NODE_EXTRA_CA_CERTS=~/.config/ccmproxy/ca/ca.crt` for Claude Code instead.
+- **macOS** routes only `127.0.0.1` to loopback by default. Either use
+  `127.0.0.1:443` in step 3, or add the alias:
+  `sudo ifconfig lo0 alias 127.1.0.101`.
+- The proxy resolves `api.anthropic.com` itself, over DNS, so the `/etc/hosts`
+  line does not send it back to itself. See [Name resolution](#name-resolution).
+
+## What it does
 
 All traffic is forwarded to `api.anthropic.com` exactly as it arrives, with two
 exceptions:
@@ -16,15 +106,14 @@ subscription over OAuth 2.0 (authorization code + PKCE), the same way the Codex
 CLI does. The OAuth and Responses API details follow
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
 
-Claude Code needs **no `ANTHROPIC_BASE_URL` change**: the proxy has its own
-local CA and terminates TLS for `api.anthropic.com` itself. The certificates
-are created once and reused, so the anchor you trust keeps working — and the
-CA's *private* key is never stored.
+The certificates are created once and reused, so the anchor you trust keeps
+working — and the CA's *private* key is never stored.
 
 ## How the interception works
 
 ```
-Claude Code ──HTTPS_PROXY──▶ CONNECT api.anthropic.com:443
+Claude Code ──/etc/hosts──▶ TLS to api.anthropic.com:443   (quick start)
+            ──HTTPS_PROXY─▶ CONNECT api.anthropic.com:443   (alternative)
                                  │
                     ┌────────────┴─────────────┐
                     │  host intercepted?       │
@@ -56,8 +145,8 @@ Three ways to reach the proxy, all serving the same router:
 
 | Listener | Config key | Default | Use |
 | --- | --- | --- | --- |
-| CONNECT proxy | `listen_proxy` | `127.0.0.1:8080` | `HTTPS_PROXY` — the recommended path, no base URL change |
-| Direct TLS | `listen_tls` | `127.0.0.1:8443` | a hosts-file or DNS redirect of `api.anthropic.com` |
+| Direct TLS | `listen_tls` | `127.0.0.1:8443` | a hosts-file or DNS redirect of `api.anthropic.com` — the quick start |
+| CONNECT proxy | `listen_proxy` | `127.0.0.1:8080` | `HTTPS_PROXY`, for clients you would rather not redirect |
 | Plain HTTP | `listen_http` | `127.0.0.1:8081` | local testing, or `ANTHROPIC_BASE_URL` if you prefer it |
 
 **Listeners are opt-in once a configuration file exists.** Only the ones the
@@ -93,42 +182,19 @@ release workflow stamps the tag with `-ldflags "-X main.version=..."`.
 Dependencies: `gjson`/`sjson` for JSON rewriting and
 `golang.org/x/net/dns/dnsmessage` for the DNS wire format.
 
-## Setup
+## Alternative: reach the proxy over `HTTPS_PROXY`
 
-**1. Sign in to your ChatGPT account.** If you already use the Codex CLI,
-**skip this step** — `~/.codex/auth.json` is picked up as is. Otherwise:
-
-```sh
-./ccmproxy login codex
-```
-
-(opens a browser; add `--no-browser` on a headless machine and open the printed
-URL yourself). Credentials land in `~/.config/ccmproxy/auth/codex.json` with
-mode `600`. See [Credentials](#credentials) for the lookup order.
-
-**2. Start the proxy.** The local CA is generated on first run.
+Instead of redirecting the hostname, Claude Code can be pointed at the proxy's
+CONNECT listener. This needs no `sudo` and no privileged port, but it does need
+the environment set for every client.
 
 ```sh
-./ccmproxy serve
-```
-
-**3. Point Claude Code at it.** `ccmproxy env` prints exactly what is needed:
-
-```sh
-eval "$(./ccmproxy env)"
+./ccmproxy serve                 # listen_proxy defaults to 127.0.0.1:8080
+eval "$(./ccmproxy env)"         # HTTPS_PROXY, HTTP_PROXY, NODE_EXTRA_CA_CERTS
 claude
 ```
 
-which sets:
-
-```sh
-export HTTPS_PROXY=http://127.0.0.1:8080
-export HTTP_PROXY=http://127.0.0.1:8080
-export NODE_EXTRA_CA_CERTS=/home/you/.config/ccmproxy/ca/ca.crt
-```
-
-`NODE_EXTRA_CA_CERTS` is how Claude Code (a Node program) trusts the local CA.
-To make it permanent instead, put the same values in `~/.claude/settings.json`:
+To make it permanent, put the same values in `~/.claude/settings.json`:
 
 ```json
 {
@@ -139,8 +205,8 @@ To make it permanent instead, put the same values in `~/.claude/settings.json`:
 }
 ```
 
-**4. Put the models in the `/model` picker.** Claude Code builds that list
-from its own catalog, not from the API, so it needs one client-side setting:
+Either way the models still need to reach the `/model` picker, with
+`--experimental-modify-bootstrap-models` or a `modelPicker` block:
 
 ```sh
 ./ccmproxy models --settings-json > /tmp/picker.json
@@ -148,9 +214,6 @@ jq -s '.[0] * .[1]' ~/.claude/settings.json /tmp/picker.json > /tmp/merged.json
 mv /tmp/merged.json ~/.claude/settings.json
 ```
 
-Restart Claude Code and open `/model`. See
-[Making the models appear in `/model`](#making-the-models-appear-in-model) for
-why this is needed and for the alternative that needs no client setting.
 `./ccmproxy models` lists what is on offer.
 
 ### The certificate authority
@@ -259,7 +322,7 @@ The first condition is the opposite of what this proxy does — it keeps
 anyway. So the model list is still merged for correctness and for other
 clients (`curl`, the SDKs), but it is not what makes the picker work.
 
-### Option 1: `modelPicker` in settings.json (recommended)
+### Option 1: `modelPicker` in settings.json (stable)
 
 ```sh
 ./ccmproxy models --settings-json
@@ -300,7 +363,7 @@ with a larger one is compacted earlier than it needs to be. Either append
 `[1m]` to the model name (the proxy strips the suffix before routing) or set
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the real window.
 
-### Option 2: `--experimental-modify-bootstrap-models`
+### Option 2: `--experimental-modify-bootstrap-models` (no client configuration)
 
 ```sh
 ./ccmproxy serve --experimental-modify-bootstrap-models

@@ -714,8 +714,12 @@ func trustHint(path string) string {
 	case "windows":
 		return "certutil -addstore -f Root " + path
 	default:
+		// update-ca-certificates only picks up files ending in .crt, and
+		// appending one blindly would turn ca.crt into ca.crt.crt.
+		name := filepath.Base(path)
+		name = strings.TrimSuffix(name, filepath.Ext(name)) + ".crt"
 		return fmt.Sprintf("sudo cp %s /usr/local/share/ca-certificates/%s && sudo update-ca-certificates",
-			path, filepath.Base(strings.TrimSuffix(path, ".pem"))+".crt")
+			path, name)
 	}
 }
 
