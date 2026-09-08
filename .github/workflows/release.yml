@@ -1,0 +1,156 @@
+name: release
+
+# Tagging is what publishes: push a v-prefixed tag and the release appears.
+# workflow_dispatch builds the same artifacts without publishing, which is how
+# to check a change to this file before cutting a tag.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into the binaries (dispatch builds are not published)"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # The toolchain comes from go.mod, so it cannot drift from the code.
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+  build:
+    name: build and release
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      # Creating the release and uploading its assets needs write access.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # A shallow clone has no tags, and the build stamps the version
+          # from the tag that triggered it.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Building ${version}"
+
+      - name: Cross-compile
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # Pure Go with no cgo, so every target builds from this one runner.
+          export CGO_ENABLED=0
+
+          for target in \
+            linux/amd64 linux/arm64 \
+            darwin/amd64 darwin/arm64 \
+            windows/amd64 windows/arm64
+          do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            export GOOS GOARCH
+
+            name="ccmproxy"
+            [ "$GOOS" = "windows" ] && name="ccmproxy.exe"
+
+            staging="$(mktemp -d)"
+            dist="${GITHUB_WORKSPACE}/dist"
+            echo "==> ${GOOS}/${GOARCH}"
+            go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "${staging}/${name}" \
+              ./cmd/ccmproxy
+            cp README.md "${staging}/"
+
+            archive="ccmproxy_${VERSION}_${GOOS}_${GOARCH}"
+            if [ "$GOOS" = "windows" ]; then
+              # Written straight to dist so zip never sees its own output.
+              (cd "${staging}" && zip -q -r "${dist}/${archive}.zip" .)
+            else
+              tar -czf "${dist}/${archive}.tar.gz" -C "${staging}" .
+            fi
+            rm -rf "${staging}"
+          done
+
+          # One checksum file covering every archive, so a download can be
+          # verified without fetching them all.
+          (cd dist && sha256sum ccmproxy_* > checksums.txt)
+          ls -l dist
+          cat dist/checksums.txt
+
+      - name: Smoke-test the host binary
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # An archive that cannot run is worse than no release; check the
+          # one target this runner can execute.
+          workdir="$(mktemp -d)"
+          tar -xzf "dist/ccmproxy_${VERSION}_linux_amd64.tar.gz" -C "$workdir"
+          "$workdir/ccmproxy" version
+          "$workdir/ccmproxy" version | grep -q "ccmproxy ${VERSION}"
+          "$workdir/ccmproxy" models > /dev/null
+          "$workdir/ccmproxy" models --settings-json > /dev/null
+
+      - name: Upload the build for a dispatch run
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ccmproxy-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # A tag containing a hyphen is a pre-release (v1.2.0-rc.1).
+          prerelease: ${{ contains(github.ref_name, '-') }}

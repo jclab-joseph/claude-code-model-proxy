@@ -66,13 +66,31 @@ listener, rather than falling back to the default address. The defaults above
 apply only when there is no configuration file. `ccmproxy status` shows which
 listeners are on, and `serve` fails with a clear message if none are.
 
-## Build
+## Install
+
+Download the archive for your platform from the
+[latest release](https://github.com/jclab-joseph/claude-code-model-proxy/releases/latest)
+and verify it against `checksums.txt`:
+
+```sh
+sha256sum -c checksums.txt --ignore-missing
+tar -xzf ccmproxy_*_linux_amd64.tar.gz     # or unzip on Windows
+./ccmproxy version
+```
+
+Builds are published for `linux`, `darwin` and `windows` on both `amd64` and
+`arm64`. They are statically linked (`CGO_ENABLED=0`), so there is nothing to
+install alongside them.
+
+## Build from source
 
 ```sh
 go build -o ccmproxy ./cmd/ccmproxy
 ```
 
-Go 1.26 or newer. Dependencies: `gjson`/`sjson` for JSON rewriting and
+Go 1.26 or newer. `ccmproxy version` reports `dev` for a plain `go build`; the
+release workflow stamps the tag with `-ldflags "-X main.version=..."`.
+Dependencies: `gjson`/`sjson` for JSON rewriting and
 `golang.org/x/net/dns/dnsmessage` for the DNS wire format.
 
 ## Setup
