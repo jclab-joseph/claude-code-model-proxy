@@ -33,21 +33,41 @@ type testServer struct {
 	tcpCount atomic.Int64
 }
 
+// listenBoth binds the same port number on UDP and on TCP.
+//
+// A DNS server has to answer on both, and the resolver is given one address
+// for the pair. UDP and TCP have independent port spaces, though, so a port
+// the kernel hands out for UDP can already be in use on TCP by anything else
+// on the machine — which made these tests fail under load. Retrying until a
+// port is free on both is what makes the pairing reliable.
+func listenBoth(t *testing.T) (*net.UDPConn, *net.TCPListener) {
+	t.Helper()
+
+	const attempts = 64
+	for attempt := 0; attempt < attempts; attempt++ {
+		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatalf("listen udp: %v", err)
+		}
+		port := udpConn.LocalAddr().(*net.UDPAddr).Port
+
+		tcpListener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+		if err == nil {
+			return udpConn, tcpListener
+		}
+		_ = udpConn.Close()
+	}
+
+	t.Fatalf("no port was free on both UDP and TCP after %d attempts", attempts)
+	return nil, nil
+}
+
 // startDNS serves the given zones on a loopback port over both UDP and TCP.
 func startDNS(t *testing.T, zones map[string]zone) *testServer {
 	t.Helper()
 
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatalf("listen udp: %v", err)
-	}
+	udpConn, tcpListener := listenBoth(t)
 	port := udpConn.LocalAddr().(*net.UDPAddr).Port
-
-	tcpListener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
-	if err != nil {
-		_ = udpConn.Close()
-		t.Fatalf("listen tcp: %v", err)
-	}
 
 	server := &testServer{addr: fmt.Sprintf("127.0.0.1:%d", port)}
 	t.Cleanup(func() {
