@@ -5,6 +5,7 @@ package e2e
 import (
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"strings"
 	"testing"
 )
@@ -33,6 +34,22 @@ func TestScenarios(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+// TestBootstrapListsTheAddedModels checks that the startup response Claude
+// Code builds its /model picker from carries every advertised model. The
+// picker itself is interactive, so this reads what the proxy did instead.
+func TestBootstrapListsTheAddedModels(t *testing.T) {
+	s := newSession(t)
+	s.ask(claudeModel(), "Reply with exactly the single word: ok")
+
+	log, err := os.ReadFile(env.proxyLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), "bootstrap: added") {
+		t.Fatalf("the bootstrap response was not extended; proxy log: %s", env.proxyLog)
 	}
 }
 

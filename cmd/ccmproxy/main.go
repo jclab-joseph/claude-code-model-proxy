@@ -84,10 +84,7 @@ func run(args []string) error {
 		return runVersion()
 	}
 
-	command := "serve"
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		command, args = args[0], args[1:]
-	}
+	command, args := splitCommand(args, "serve")
 
 	switch command {
 	case "serve":
@@ -118,17 +115,61 @@ func run(args []string) error {
 	}
 }
 
+// valueFlags are the common flags that take their value as the next
+// argument, which splitCommand must skip over.
+var valueFlags = map[string]bool{"config": true, "log": true}
+
+// splitCommand finds the first argument that is not a flag, so the common
+// flags may come before it as well as after: `ccmproxy --config x serve` and
+// `ccmproxy serve --config x` are the same. fallback is returned when there is
+// none. The remaining arguments keep their order.
+func splitCommand(args []string, fallback string) (string, []string) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if !strings.HasPrefix(arg, "-") {
+			rest := append(append([]string{}, args[:i]...), args[i+1:]...)
+			return arg, rest
+		}
+		if name := strings.TrimLeft(arg, "-"); !strings.Contains(name, "=") && valueFlags[name] {
+			i++
+		}
+	}
+	return fallback, args
+}
+
 // commonFlags registers the flags every subcommand accepts and returns the
-// loaded configuration.
-func commonFlags(name string, args []string, extra func(*flag.FlagSet)) (*config.Config, *flag.FlagSet, error) {
+// loaded configuration and the positional arguments.
+//
+// Flags are read wherever they appear among the arguments. The flag package
+// alone stops at the first positional argument and leaves every flag after it
+// unparsed, which silently dropped --experimental-modify-bootstrap-models from
+// `ccmproxy --config x serve --experimental-modify-bootstrap-models`.
+// Positional arguments are an error unless the command takes them, so a flag
+// can no longer be ignored without a word.
+func commonFlags(name string, args []string, positional bool, extra func(*flag.FlagSet)) (*config.Config, []string, error) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	configPath := fs.String("config", "", "configuration file")
 	logLevel := fs.String("log", "", "log level: debug, info, warn, error")
 	if extra != nil {
 		extra(fs)
 	}
-	if err := fs.Parse(args); err != nil {
-		return nil, nil, err
+	var rest []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, nil, err
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		args = fs.Args()
+		rest = append(rest, args[0])
+		args = args[1:]
+	}
+	if len(rest) > 0 && !positional {
+		return nil, nil, fmt.Errorf("%s: unexpected argument %q", name, rest[0])
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -139,7 +180,7 @@ func commonFlags(name string, args []string, extra func(*flag.FlagSet)) (*config
 		cfg.LogLevel = *logLevel
 	}
 	logx.SetLevel(cfg.LogLevel)
-	return cfg, fs, nil
+	return cfg, rest, nil
 }
 
 // resolverOrNil keeps a nil *resolve.Resolver from becoming a non-nil dialer
@@ -204,7 +245,7 @@ func directTransport(dial dialer) *http.Transport {
 
 func runServe(args []string) error {
 	var noProxy, noTLS, noHTTP, modifyBootstrap bool
-	cfg, _, err := commonFlags("serve", args, func(fs *flag.FlagSet) {
+	cfg, _, err := commonFlags("serve", args, false, func(fs *flag.FlagSet) {
 		fs.BoolVar(&noProxy, "no-proxy-listener", false, "do not start the HTTP CONNECT proxy")
 		fs.BoolVar(&noTLS, "no-tls-listener", false, "do not start the direct TLS listener")
 		fs.BoolVar(&noHTTP, "no-http-listener", false, "do not start the plain HTTP listener")
@@ -351,16 +392,13 @@ func runServe(args []string) error {
 }
 
 func runLogin(args []string) error {
-	provider := "codex"
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		provider, args = args[0], args[1:]
-	}
+	provider, args := splitCommand(args, "codex")
 	if provider != "codex" {
 		return fmt.Errorf("unknown provider %q; only `codex` is supported", provider)
 	}
 
 	var noBrowser bool
-	cfg, _, err := commonFlags("login", args, func(fs *flag.FlagSet) {
+	cfg, _, err := commonFlags("login", args, false, func(fs *flag.FlagSet) {
 		fs.BoolVar(&noBrowser, "no-browser", false, "print the URL instead of opening a browser")
 	})
 	if err != nil {
@@ -406,15 +444,12 @@ func runLogin(args []string) error {
 }
 
 func runLogout(args []string) error {
-	provider := "codex"
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		provider, args = args[0], args[1:]
-	}
+	provider, args := splitCommand(args, "codex")
 	if provider != "codex" {
 		return fmt.Errorf("unknown provider %q; only `codex` is supported", provider)
 	}
 
-	cfg, _, err := commonFlags("logout", args, nil)
+	cfg, _, err := commonFlags("logout", args, false, nil)
 	if err != nil {
 		return err
 	}
@@ -436,7 +471,7 @@ func runLogout(args []string) error {
 }
 
 func runStatus(args []string) error {
-	cfg, _, err := commonFlags("status", args, nil)
+	cfg, _, err := commonFlags("status", args, false, nil)
 	if err != nil {
 		return err
 	}
@@ -495,7 +530,7 @@ func runStatus(args []string) error {
 
 func runModels(args []string) error {
 	var settingsJSON, bootstrapJSON bool
-	cfg, _, err := commonFlags("models", args, func(fs *flag.FlagSet) {
+	cfg, _, err := commonFlags("models", args, false, func(fs *flag.FlagSet) {
 		fs.BoolVar(&settingsJSON, "settings-json", false,
 			"print a modelPicker block to merge into Claude Code's settings.json")
 		fs.BoolVar(&bootstrapJSON, "bootstrap-json", false,
@@ -625,7 +660,7 @@ func printJSON(value any) error {
 
 func runCA(args []string) error {
 	var export string
-	cfg, _, err := commonFlags("ca", args, func(fs *flag.FlagSet) {
+	cfg, _, err := commonFlags("ca", args, false, func(fs *flag.FlagSet) {
 		fs.StringVar(&export, "export", "", "write the certificate to this path")
 	})
 	if err != nil {
@@ -661,7 +696,7 @@ func runCA(args []string) error {
 
 func runEnv(args []string) error {
 	var shell string
-	cfg, _, err := commonFlags("env", args, func(fs *flag.FlagSet) {
+	cfg, _, err := commonFlags("env", args, false, func(fs *flag.FlagSet) {
 		fs.StringVar(&shell, "shell", "posix", "posix, fish or powershell")
 	})
 	if err != nil {
@@ -676,11 +711,10 @@ func runEnv(args []string) error {
 // runDNS resolves names the way the proxy does, which is how to confirm that
 // a hosts-file entry is being bypassed.
 func runDNS(args []string) error {
-	cfg, fs, err := commonFlags("dns", args, nil)
+	cfg, hosts, err := commonFlags("dns", args, true, nil)
 	if err != nil {
 		return err
 	}
-	hosts := fs.Args()
 	if len(hosts) == 0 {
 		hosts = []string{strings.TrimPrefix(strings.TrimPrefix(cfg.Upstream, "https://"), "http://")}
 	}
@@ -741,15 +775,12 @@ func runVersion() error {
 }
 
 func runConfig(args []string) error {
-	action := "init"
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		action, args = args[0], args[1:]
-	}
+	action, args := splitCommand(args, "init")
 	if action != "init" {
 		return fmt.Errorf("unknown config action %q; only `init` is supported", action)
 	}
 
-	cfg, _, err := commonFlags("config", args, nil)
+	cfg, _, err := commonFlags("config", args, false, nil)
 	if err != nil {
 		return err
 	}

@@ -134,7 +134,8 @@ openrouter:
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	proxy := exec.CommandContext(ctx, binary, "serve", "--config", configPath)
+	// The argument order run.sh uses: the common flags before the command.
+	proxy := exec.CommandContext(ctx, binary, "--config", configPath, "serve", "--experimental-modify-bootstrap-models")
 	proxy.Stdout, proxy.Stderr = logFile, logFile
 	if err := proxy.Start(); err != nil {
 		return 0, fmt.Errorf("start proxy: %w", err)
