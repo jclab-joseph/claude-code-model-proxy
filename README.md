@@ -34,11 +34,9 @@ leaves `127.0.0.1:443` free for anything else.
 
 ```sh
 mkdir -p ~/.config/ccmproxy
-cat > ~/.config/ccmproxy/config.json <<'JSON'
-{
-  "listen_tls": "127.1.0.101:443"
-}
-JSON
+cat > ~/.config/ccmproxy/config.yaml <<'YAML'
+listen_tls: 127.1.0.101:443
+YAML
 ```
 
 **4. Allow it to bind port 443 without running as root.**
@@ -179,8 +177,9 @@ go build -o ccmproxy ./cmd/ccmproxy
 
 Go 1.26 or newer. `ccmproxy version` reports `dev` for a plain `go build`; the
 release workflow stamps the tag with `-ldflags "-X main.version=..."`.
-Dependencies: `gjson`/`sjson` for JSON rewriting and
-`golang.org/x/net/dns/dnsmessage` for the DNS wire format.
+Dependencies: `gjson`/`sjson` for JSON rewriting,
+`golang.org/x/net/dns/dnsmessage` for the DNS wire format and
+`go.yaml.in/yaml/v3` for the configuration file.
 
 ## Alternative: reach the proxy over `HTTPS_PROXY`
 
@@ -487,8 +486,14 @@ Two endpoints are served on the intercepted host itself:
 
 ## Configuration
 
-`~/.config/ccmproxy/config.json` (override with `--config`, or relocate the
-whole directory with `CCMPROXY_HOME` / `XDG_CONFIG_HOME`). A leading `~` is
+`~/.config/ccmproxy/config.yaml` (override with `--config`, or relocate the
+whole directory with `CCMPROXY_HOME` / `XDG_CONFIG_HOME`). YAML is the primary
+format; JSON is still read, so an existing `config.json` keeps working. With no
+`--config`, the first of `config.yaml`, `config.yml` and `config.json` found in
+that directory is used. The format follows the extension: `.json` is JSON,
+anything else is YAML, and the keys are the same in both.
+
+A leading `~` is
 expanded in every path setting — `ca_dir`, `auth_dir`, `codex.auth_file`,
 `--config` and `ca --export` — since a value read from a file never passes
 through a shell. `~otheruser` is not expanded. Every field is
@@ -497,38 +502,35 @@ keys, which turn a listener **on**: omit one and that listener does not start.
 `ccmproxy config init` writes this file with every field filled in, which is
 the easiest starting point.
 
-```json
-{
-  "listen_proxy": "127.0.0.1:8080",
-  "listen_tls": "127.0.0.1:8443",
-  "listen_http": "127.0.0.1:8081",
-  "upstream": "https://api.anthropic.com",
-  "intercept_hosts": ["api.anthropic.com"],
-  "proxy_username": "",
-  "proxy_password": "",
-  "ca_dir": "~/.config/ccmproxy/ca",
-  "auth_dir": "~/.config/ccmproxy/auth",
-  "log_level": "info",
-  "codex": {
-    "base_url": "https://chatgpt.com/backend-api/codex",
-    "user_agent": "codex-tui/...",
-    "originator": "codex-tui",
-    "models": [],
-    "effort_variants": false,
-    "model_prefix": "",
-    "callback_port": 1455,
-    "auth_file": "",
-    "use_codex_cli_auth": true
-  },
-  "dns": {
-    "enabled": true,
-    "servers": [],
-    "timeout_ms": 5000,
-    "static": {},
-    "min_ttl_seconds": 30,
-    "max_ttl_seconds": 3600
-  }
-}
+```yaml
+listen_proxy: 127.0.0.1:8080
+listen_tls: 127.0.0.1:8443
+listen_http: 127.0.0.1:8081
+upstream: https://api.anthropic.com
+intercept_hosts:
+  - api.anthropic.com
+proxy_username: ""
+proxy_password: ""
+ca_dir: ~/.config/ccmproxy/ca
+auth_dir: ~/.config/ccmproxy/auth
+log_level: info
+codex:
+  base_url: https://chatgpt.com/backend-api/codex
+  user_agent: codex-tui/...
+  originator: codex-tui
+  models: []
+  effort_variants: false
+  model_prefix: ""
+  callback_port: 1455
+  auth_file: ""
+  use_codex_cli_auth: true
+dns:
+  enabled: true
+  servers: []
+  timeout_ms: 5000
+  static: {}
+  min_ttl_seconds: 30
+  max_ttl_seconds: 3600
 ```
 
 Setting both `proxy_username` and `proxy_password` requires Basic credentials

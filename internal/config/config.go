@@ -3,11 +3,14 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"go.yaml.in/yaml/v3"
 )
 
 // DefaultUpstream is the Anthropic API endpoint every non-intercepted request
@@ -20,13 +23,13 @@ const DefaultInterceptHost = "api.anthropic.com"
 // Codex groups the settings of the OpenAI Codex (ChatGPT subscription) backend.
 type Codex struct {
 	// BaseURL is the ChatGPT backend that serves the Responses API.
-	BaseURL string `json:"base_url"`
+	BaseURL string `json:"base_url" yaml:"base_url"`
 	// UserAgent and Originator identify the request as coming from the Codex
 	// CLI, which is the client the subscription endpoint expects.
-	UserAgent  string `json:"user_agent"`
-	Originator string `json:"originator"`
+	UserAgent  string `json:"user_agent" yaml:"user_agent"`
+	Originator string `json:"originator" yaml:"originator"`
 	// Models restricts the exposed catalog to these ids when non-empty.
-	Models []string `json:"models,omitempty"`
+	Models []string `json:"models,omitempty" yaml:"models,omitempty"`
 	// EffortVariants adds one model entry per supported reasoning level
 	// (for example gpt-5.5-high) to the advertised model list.
 	//
@@ -34,19 +37,19 @@ type Codex struct {
 	// and --effort, and sends it with the request, so per-effort ids only
 	// multiply the picker rows. Turn it on for a client that has no effort
 	// control of its own.
-	EffortVariants bool `json:"effort_variants"`
+	EffortVariants bool `json:"effort_variants" yaml:"effort_variants"`
 	// ModelPrefix, when set, is accepted (and advertised) in front of every
 	// Codex model id, e.g. "codex/gpt-5.5".
-	ModelPrefix string `json:"model_prefix,omitempty"`
+	ModelPrefix string `json:"model_prefix,omitempty" yaml:"model_prefix,omitempty"`
 	// CallbackPort is the loopback port the OAuth redirect URI points at. The
 	// value is fixed by the registered OAuth client and should not change.
-	CallbackPort int `json:"callback_port"`
+	CallbackPort int `json:"callback_port" yaml:"callback_port"`
 	// AuthFile, when set, is the only credential file consulted, in either
 	// this proxy's layout or the Codex CLI's.
-	AuthFile string `json:"auth_file,omitempty"`
+	AuthFile string `json:"auth_file,omitempty" yaml:"auth_file,omitempty"`
 	// UseCLIAuth reads (and keeps in sync) the Codex CLI's
 	// ~/.codex/auth.json when this proxy has no credentials of its own.
-	UseCLIAuth bool `json:"use_codex_cli_auth"`
+	UseCLIAuth bool `json:"use_codex_cli_auth" yaml:"use_codex_cli_auth"`
 }
 
 // DNS configures the proxy's own resolver, which is used for every outbound
@@ -59,18 +62,18 @@ type DNS struct {
 	// Enabled turns the internal resolver on. With it off, outbound
 	// connections go through the operating system resolver, which honours
 	// /etc/hosts and can therefore loop.
-	Enabled bool `json:"enabled"`
+	Enabled bool `json:"enabled" yaml:"enabled"`
 	// Servers are the nameservers to query, as host or host:port. When empty
 	// they come from /etc/resolv.conf, skipping loopback stub resolvers
 	// (systemd-resolved, dnsmasq) because those consult /etc/hosts as well.
-	Servers []string `json:"servers,omitempty"`
+	Servers []string `json:"servers,omitempty" yaml:"servers,omitempty"`
 	// TimeoutMS bounds a single DNS query.
-	TimeoutMS int `json:"timeout_ms"`
+	TimeoutMS int `json:"timeout_ms" yaml:"timeout_ms"`
 	// Static pins hostnames to IP addresses, answered without any query.
-	Static map[string][]string `json:"static,omitempty"`
+	Static map[string][]string `json:"static,omitempty" yaml:"static,omitempty"`
 	// MinTTLSeconds and MaxTTLSeconds clamp how long an answer is cached.
-	MinTTLSeconds int `json:"min_ttl_seconds"`
-	MaxTTLSeconds int `json:"max_ttl_seconds"`
+	MinTTLSeconds int `json:"min_ttl_seconds" yaml:"min_ttl_seconds"`
+	MaxTTLSeconds int `json:"max_ttl_seconds" yaml:"max_ttl_seconds"`
 }
 
 // listenerKeys are the configuration keys that open a listener. A key absent
@@ -84,32 +87,32 @@ var listenerKeys = []string{"listen_proxy", "listen_tls", "listen_http"}
 type Config struct {
 	// ListenProxy serves the HTTP CONNECT proxy Claude Code is pointed at.
 	// Empty disables it.
-	ListenProxy string `json:"listen_proxy"`
+	ListenProxy string `json:"listen_proxy" yaml:"listen_proxy"`
 	// ListenTLS serves the same router directly over TLS using a certificate
 	// for the intercepted host, for hosts-file style redirection. Empty
 	// disables it.
-	ListenTLS string `json:"listen_tls"`
+	ListenTLS string `json:"listen_tls" yaml:"listen_tls"`
 	// ListenHTTP serves the router over plain HTTP, which is handy for local
 	// testing and for ANTHROPIC_BASE_URL setups. Empty disables it.
-	ListenHTTP string `json:"listen_http"`
+	ListenHTTP string `json:"listen_http" yaml:"listen_http"`
 
 	// Upstream is where pass-through traffic goes.
-	Upstream string `json:"upstream"`
+	Upstream string `json:"upstream" yaml:"upstream"`
 	// InterceptHosts are the CONNECT targets whose TLS is terminated locally.
 	// Everything else is tunnelled untouched.
-	InterceptHosts []string `json:"intercept_hosts"`
+	InterceptHosts []string `json:"intercept_hosts" yaml:"intercept_hosts"`
 
 	// ProxyUsername and ProxyPassword, when both set, require Basic
 	// credentials on the CONNECT proxy.
-	ProxyUsername string `json:"proxy_username,omitempty"`
-	ProxyPassword string `json:"proxy_password,omitempty"`
+	ProxyUsername string `json:"proxy_username,omitempty" yaml:"proxy_username,omitempty"`
+	ProxyPassword string `json:"proxy_password,omitempty" yaml:"proxy_password,omitempty"`
 
 	// CADir stores the local CA, AuthDir the provider credentials.
-	CADir   string `json:"ca_dir"`
-	AuthDir string `json:"auth_dir"`
+	CADir   string `json:"ca_dir" yaml:"ca_dir"`
+	AuthDir string `json:"auth_dir" yaml:"auth_dir"`
 
 	// LogLevel is one of debug, info, warn, error.
-	LogLevel string `json:"log_level"`
+	LogLevel string `json:"log_level" yaml:"log_level"`
 
 	// ExperimentalModifyBootstrapModels makes the proxy add its models to
 	// Claude Code's startup response, so they appear in the /model picker
@@ -119,13 +122,13 @@ type Config struct {
 	// --experimental-modify-bootstrap-models flag: it rewrites an
 	// undocumented Claude Code response rather than a published Anthropic
 	// API one, and the shape can change with any Claude Code release.
-	ExperimentalModifyBootstrapModels bool `json:"-"`
+	ExperimentalModifyBootstrapModels bool `json:"-" yaml:"-"`
 
-	Codex Codex `json:"codex"`
-	DNS   DNS   `json:"dns"`
+	Codex Codex `json:"codex" yaml:"codex"`
+	DNS   DNS   `json:"dns" yaml:"dns"`
 
 	// path records where the config was loaded from, for Save.
-	path string `json:"-"`
+	path string `json:"-" yaml:"-"`
 }
 
 // ExpandUser resolves a leading "~" to the user's home directory.
@@ -174,8 +177,30 @@ func Root() string {
 	return filepath.Join(home, ".config", "ccmproxy")
 }
 
-// DefaultPath reports the default config file location.
-func DefaultPath() string { return filepath.Join(Root(), "config.json") }
+// defaultNames are the file names looked for in Root, in order of preference.
+// YAML is the primary format; config.json is still found so an existing
+// installation keeps working without being converted.
+var defaultNames = []string{"config.yaml", "config.yml", "config.json"}
+
+// DefaultPath reports the config file used when none is named: the first of
+// config.yaml, config.yml and config.json that exists in Root, or config.yaml
+// when there is none yet.
+func DefaultPath() string {
+	root := Root()
+	for _, name := range defaultNames {
+		path := filepath.Join(root, name)
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return filepath.Join(root, defaultNames[0])
+}
+
+// isJSON reports whether path is read and written as JSON. Every other
+// extension is YAML, the primary format.
+func isJSON(path string) bool {
+	return strings.EqualFold(filepath.Ext(path), ".json")
+}
 
 // Default returns a fully populated configuration.
 func Default() *Config {
@@ -230,14 +255,8 @@ func Load(path string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
-	if err := json.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
-	}
-
-	// Which top-level keys the file actually sets cannot be recovered from
-	// the decoded struct, so the raw object is inspected for them.
-	var present map[string]json.RawMessage
-	if err := json.Unmarshal(data, &present); err != nil {
+	present, err := decode(path, data, cfg)
+	if err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 	cfg.disableUnlistedListeners(present)
@@ -246,10 +265,44 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// decode fills cfg from data in the format path names and reports which
+// top-level keys the file sets. Those cannot be recovered from the decoded
+// struct, so the document is decoded a second time as a plain map.
+func decode(path string, data []byte, cfg *Config) (map[string]bool, error) {
+	present := make(map[string]bool)
+	if isJSON(path) {
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(data, &keys); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal(data, cfg); err != nil {
+			return nil, err
+		}
+		for key := range keys {
+			present[key] = true
+		}
+		return present, nil
+	}
+
+	// An empty YAML document decodes to nothing, which is the same as an
+	// empty object: every default applies and no listener is started.
+	var keys map[string]yaml.Node
+	if err := yaml.Unmarshal(data, &keys); err != nil {
+		return nil, err
+	}
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, err
+	}
+	for key := range keys {
+		present[key] = true
+	}
+	return present, nil
+}
+
 // disableUnlistedListeners clears every listener the file did not mention.
-func (c *Config) disableUnlistedListeners(present map[string]json.RawMessage) {
+func (c *Config) disableUnlistedListeners(present map[string]bool) {
 	for _, key := range listenerKeys {
-		if _, ok := present[key]; ok {
+		if present[key] {
 			continue
 		}
 		switch key {
@@ -353,21 +406,41 @@ func (c *Config) Path() string {
 	return c.path
 }
 
-// Save writes the configuration back to disk, creating parent directories.
+// Save writes the configuration back to disk, creating parent directories. The
+// format follows the file extension, as in Load.
 func (c *Config) Save() error {
 	path := c.Path()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("config: create %s: %w", filepath.Dir(path), err)
 	}
-	data, err := json.MarshalIndent(c, "", "  ")
+	data, err := c.encode(path)
 	if err != nil {
 		return fmt.Errorf("config: encode: %w", err)
 	}
-	data = append(data, '\n')
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("config: write %s: %w", path, err)
 	}
 	return nil
+}
+
+func (c *Config) encode(path string) ([]byte, error) {
+	if isJSON(path) {
+		data, err := json.MarshalIndent(c, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		return append(data, '\n'), nil
+	}
+	var buf bytes.Buffer
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(c); err != nil {
+		return nil, err
+	}
+	if err := encoder.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // Intercepts reports whether TLS for host should be terminated locally.
