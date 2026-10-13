@@ -99,6 +99,42 @@ func TestToolUseAndResultBecomeFunctionCallItems(t *testing.T) {
 	}
 }
 
+func TestParallelToolResultsFollowCallOrder(t *testing.T) {
+	// Claude Code appends results as the tools finish: here b, then c, then a.
+	body := mustConvert(t, Options{}, `{
+		"model": "gpt-5.5",
+		"messages": [
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"toolu_a","name":"Read","input":{"file_path":"/a"}},
+				{"type":"tool_use","id":"toolu_b","name":"Read","input":{"file_path":"/b"}},
+				{"type":"tool_use","id":"toolu_c","name":"Read","input":{"file_path":"/c"}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"toolu_b","content":"B"},
+				{"type":"tool_result","tool_use_id":"toolu_unknown","content":"?"},
+				{"type":"tool_result","tool_use_id":"toolu_c","content":"C"},
+				{"type":"tool_result","tool_use_id":"toolu_a","content":"A"},
+				{"type":"text","text":"next"}
+			]}
+		]
+	}`)
+
+	var got []string
+	for _, item := range body.Get("input").Array() {
+		if item.Get("type").String() == "function_call_output" {
+			got = append(got, item.Get("call_id").String()+"="+item.Get("output").String())
+		}
+	}
+	want := "toolu_a=A toolu_b=B toolu_c=C toolu_unknown=?"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("outputs = %v, want %s", got, want)
+	}
+	// The text that followed the results stays after them.
+	if last := body.Get("input.@reverse.0.content.0.text").String(); last != "next" {
+		t.Fatalf("last input text = %q, want next", last)
+	}
+}
+
 func TestOnlyProxyIssuedThinkingIsReplayed(t *testing.T) {
 	body := mustConvert(t, Options{}, `{
 		"model": "gpt-5.5",

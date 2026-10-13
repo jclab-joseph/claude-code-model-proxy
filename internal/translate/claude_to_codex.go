@@ -201,6 +201,43 @@ func appendMessageItems(items [][]byte, messages gjson.Result, shortNames map[st
 		}
 		flush()
 	}
+	return orderToolOutputs(items)
+}
+
+// orderToolOutputs puts each run of consecutive function_call_output items in
+// the order of the function_call items they answer.
+//
+// Claude Code appends parallel tool results in the order the tools finish,
+// not the order they were called. The call_ids still pair them correctly, but
+// Codex models read the outputs positionally and attribute them to the wrong
+// call when the two orders differ. Outputs whose call is unknown keep their
+// place after the ones that are.
+func orderToolOutputs(items [][]byte) [][]byte {
+	callIndex := make(map[string]int)
+	for i := 0; i < len(items); i++ {
+		switch gjson.GetBytes(items[i], "type").String() {
+		case "function_call":
+			callIndex[gjson.GetBytes(items[i], "call_id").String()] = i
+			continue
+		case "function_call_output":
+		default:
+			continue
+		}
+
+		end := i + 1
+		for end < len(items) && gjson.GetBytes(items[end], "type").String() == "function_call_output" {
+			end++
+		}
+		run := items[i:end]
+		rank := func(item []byte) int {
+			if index, ok := callIndex[gjson.GetBytes(item, "call_id").String()]; ok {
+				return index
+			}
+			return len(items)
+		}
+		sort.SliceStable(run, func(a, b int) bool { return rank(run[a]) < rank(run[b]) })
+		i = end - 1
+	}
 	return items
 }
 
