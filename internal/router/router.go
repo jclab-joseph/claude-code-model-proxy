@@ -135,6 +135,12 @@ func (r *Router) serveMessages(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if gjson.GetBytes(body.JSON, "thread.type").String() == "continue" {
+		logx.Infof("codex messages model=%s: refusing a thread continue so the client resends the full conversation", model)
+		writeThreadUnsupported(w)
+		return
+	}
+
 	effort := resolveEffort(body.JSON, resolution)
 	logx.Infof("codex messages model=%s -> %s effort=%s (%s body)",
 		model, resolution.Model.ID, effort, bodyEncodingLabel(body))
@@ -208,5 +214,29 @@ func writeAnthropicError(w http.ResponseWriter, status int, kind, message string
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// writeThreadUnsupported refuses an Anthropic message-threads continuation.
+//
+// A continue request leaves the system prompt, the tools and the earlier turns
+// to Anthropic's server-side copy of the thread, which a Codex model never
+// sees. Claude Code anchors threads on its last Claude reply, so this happens
+// whenever a session switches from a Claude model to an added one.
+//
+// Claude Code recognises the thread_unsupported_request error code: it resends
+// the same turn in full and keeps that model off threads for the rest of the
+// session, so the refusal costs one local round trip per session and model.
+func writeThreadUnsupported(w http.ResponseWriter) {
+	payload := map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    "invalid_request_error",
+			"message": "message threads are not supported for this model; resend the full conversation",
+			"details": map[string]string{"error_code": "thread_unsupported_request"},
+		},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
 	_ = json.NewEncoder(w).Encode(payload)
 }

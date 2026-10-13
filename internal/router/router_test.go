@@ -352,6 +352,50 @@ func TestCodexNonStreamingRequest(t *testing.T) {
 	}
 }
 
+func TestCodexThreadContinueIsRefused(t *testing.T) {
+	h := newHarness(t, nil, nil, true)
+
+	// What Claude Code sends after a switch from a Claude model: no system
+	// prompt and no tools, because it expects Anthropic to supply them.
+	body := `{"model":"gpt-5.5","max_tokens":100,"stream":true,"thread":{"type":"continue","previous_message_id":"msg_011abc"},"messages":[{"role":"user","content":"go on"}]}`
+	rec := h.do(t, http.MethodPost, "/v1/messages", body)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	// Claude Code keys its stateless resend on this exact code.
+	if got := gjson.Get(rec.Body.String(), "error.details.error_code").String(); got != "thread_unsupported_request" {
+		t.Fatalf("error_code = %q, want thread_unsupported_request: %s", got, rec.Body.String())
+	}
+	if h.codex.method != "" || h.anthropic.method != "" {
+		t.Fatal("a refused continue must not reach any upstream")
+	}
+}
+
+func TestCodexThreadCreateIsServed(t *testing.T) {
+	h := newHarness(t, nil, nil, true)
+
+	body := `{"model":"gpt-5.5","max_tokens":100,"stream":true,"thread":{"type":"create"},"messages":[{"role":"user","content":"hi"}]}`
+	if rec := h.do(t, http.MethodPost, "/v1/messages", body); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if h.codex.method == "" {
+		t.Fatal("a thread create carries the whole conversation and must reach Codex")
+	}
+}
+
+func TestClaudeThreadContinueIsPassedThrough(t *testing.T) {
+	h := newHarness(t, nil, nil, true)
+
+	body := `{"model":"claude-opus-5","max_tokens":100,"thread":{"type":"continue","previous_message_id":"msg_011abc"},"messages":[{"role":"user","content":"go on"}]}`
+	if rec := h.do(t, http.MethodPost, "/v1/messages", body); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if h.anthropic.body != body {
+		t.Fatalf("Anthropic must receive the continue unchanged, got %s", h.anthropic.body)
+	}
+}
+
 func TestCodexBackendErrorIsMapped(t *testing.T) {
 	h := newHarness(t, nil, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
