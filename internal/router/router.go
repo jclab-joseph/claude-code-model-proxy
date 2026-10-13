@@ -98,6 +98,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	case r.cfg.ExperimentalModifyBootstrapModels && req.Method == http.MethodGet && path == bootstrapPath:
 		r.serveBootstrap(w, req)
 		return
+	case r.cfg.ExperimentalModifyBootstrapModels && req.Method == http.MethodGet && selectorPath.MatchString(path):
+		r.serveModelSelector(w, req)
+		return
 	}
 
 	logx.Debugf("passthrough %s %s", req.Method, path)

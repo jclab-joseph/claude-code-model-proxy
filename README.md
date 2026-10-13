@@ -376,17 +376,34 @@ with a larger one is compacted earlier than it needs to be. Either append
 ./ccmproxy serve --experimental-modify-bootstrap-models
 ```
 
-The proxy then appends its models to `additional_model_options` in the
-`/api/claude_cli/bootstrap` response, so they show up with **no client-side
-configuration at all** — which is what makes it worth having when handing the
-proxy to a teammate.
+The proxy then adds its models to the two responses Claude Code builds the
+picker from, so they show up with **no client-side configuration at all** —
+which is what makes it worth having when handing the proxy to a teammate:
+
+- `/api/claude_cli/bootstrap` — appended to `additional_model_options`.
+- `/api/organizations/<org>/model_selector/cc` — appended as rows of the `cc`
+  model catalog. Once an account is served this catalog, Claude Code builds
+  the picker from it alone and ignores the bootstrap list, so this is the one
+  that matters on current versions. Each row carries a
+  `min_claude_code_version` (without one, Claude Code only offers models it
+  already knows), the model's `behaves_as`, its context window and its effort
+  levels.
+
+Claude Code caches the catalog for about an hour, so models added or changed
+while it is cached appear only once it refreshes. To see them at once, delete
+the cached file and restart Claude Code:
+
+```sh
+rm ~/.claude/cache/model-catalog/*-cc.json   # under $CLAUDE_CONFIG_DIR if set
+```
 
 It is experimental and off by default because it rewrites an undocumented
 Claude Code response rather than a published Anthropic API one, and the shape
 can change with any release. The implementation is deliberately timid: a
 response that is still compressed, is not JSON, carries an unexpected
-`additional_model_options` shape, or came back non-2xx is forwarded untouched,
-and a model the account already offers is never duplicated. A broken bootstrap
+`additional_model_options` or `model_selector_config` shape, or came back
+non-2xx is forwarded untouched, and a model the account already offers is
+never duplicated. A broken bootstrap
 response would take out much more than the model picker.
 
 **The two options are complementary, and using both is the best setup.**

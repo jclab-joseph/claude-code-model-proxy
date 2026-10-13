@@ -317,3 +317,94 @@ func (r *Registry) Lookup(id string) (Model, bool) {
 	model, ok := r.byID[strings.ToLower(strings.TrimSpace(id))]
 	return model, ok
 }
+
+// SelectorRow is one entry of a served model catalog's
+// model_selector_config[].models array, the list newer Claude Code versions
+// build their /model picker from. The field names are Claude Code's.
+type SelectorRow struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Section places the row in the picker: "main" rows are listed first.
+	Section string `json:"section"`
+	// MinClaudeCodeVersion makes the row selectable. Without it Claude Code
+	// offers a row only for a model it already knows, which an added model
+	// never is.
+	MinClaudeCodeVersion string `json:"min_claude_code_version"`
+	// BehavesAs names the Claude model whose client-side handling applies.
+	BehavesAs     string            `json:"behaves_as,omitempty"`
+	ContextWindow int               `json:"context_window,omitempty"`
+	Runtime       SelectorRuntime   `json:"runtime"`
+	Thinking      *SelectorThinking `json:"thinking,omitempty"`
+}
+
+// SelectorRuntime is a catalog row's runtime block.
+type SelectorRuntime struct {
+	MaxInputTokens  int      `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
+	EffortLevels    []string `json:"effort_levels,omitempty"`
+	DefaultEffort   string   `json:"default_effort,omitempty"`
+}
+
+// SelectorThinking is a catalog row's effort control.
+type SelectorThinking struct {
+	Type          string           `json:"type"`
+	EffortOptions []SelectorOption `json:"effort_options"`
+}
+
+// SelectorOption is one choice of a catalog row's effort control.
+type SelectorOption struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// selectorMinVersion is old enough for every Claude Code that serves a
+// catalog, and only there to make the row selectable.
+const selectorMinVersion = "2.1.0"
+
+// effortNames are the labels Claude Code's own catalog gives effort levels.
+var effortNames = map[string]string{
+	"none": "None", "minimal": "Minimal", "low": "Low", "medium": "Medium",
+	"high": "High", "xhigh": "Extra", "max": "Max",
+}
+
+// SelectorRows renders one served-catalog row per advertised model.
+func (r *Registry) SelectorRows() []SelectorRow {
+	rows := make([]SelectorRow, 0, len(r.ordered))
+	for _, picker := range r.PickerOptions() {
+		resolution, ok := r.Resolve(picker.Model)
+		if !ok {
+			continue
+		}
+		model := resolution.Model
+		row := SelectorRow{
+			ID:                   picker.Model,
+			Name:                 picker.Label,
+			Description:          picker.Description,
+			Section:              "main",
+			MinClaudeCodeVersion: selectorMinVersion,
+			BehavesAs:            model.BehavesAs,
+			ContextWindow:        model.ContextLength,
+			Runtime: SelectorRuntime{
+				MaxInputTokens:  model.ContextLength,
+				MaxOutputTokens: model.MaxOutput,
+			},
+		}
+		// An effort variant pins its effort, so it offers no choice.
+		if resolution.Effort == "" && len(model.ReasoningLevel) > 0 {
+			row.Runtime.EffortLevels = append([]string(nil), model.ReasoningLevel...)
+			row.Runtime.DefaultEffort = model.DefaultEffort
+			thinking := &SelectorThinking{Type: "effort"}
+			for _, level := range model.ReasoningLevel {
+				name := effortNames[level]
+				if name == "" {
+					name = level
+				}
+				thinking.EffortOptions = append(thinking.EffortOptions, SelectorOption{ID: level, Name: name})
+			}
+			row.Thinking = thinking
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
