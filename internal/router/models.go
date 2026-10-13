@@ -6,16 +6,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jclab-joseph/claude-code-model-proxy/internal/codex"
+	"github.com/jclab-joseph/claude-code-model-proxy/internal/catalog"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/logx"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
-// codexModelCreatedAt is the created_at stamp reported for the added models.
+// addedModelCreatedAt is the created_at stamp reported for the added models.
 // The list endpoint's schema requires the field; the value carries no meaning
 // for models that are not Anthropic's.
-var codexModelCreatedAt = time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
+var addedModelCreatedAt = time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339)
 
 // serveModels answers the model list with the upstream catalog plus the models
 // this proxy adds.
@@ -36,7 +36,7 @@ func (r *Router) serveModels(w http.ResponseWriter, req *http.Request) {
 		} else {
 			logx.Warnf("models: upstream returned %d", upstreamStatus)
 		}
-		if r.backend != nil && r.backend.Store.Authenticated() {
+		if r.anyReady() {
 			r.writeModelList(w, nil)
 			return
 		}
@@ -67,7 +67,7 @@ func (r *Router) writeModelList(w http.ResponseWriter, upstreamBody []byte) {
 		body = []byte(`{"data":[],"has_more":false,"first_id":null,"last_id":null}`)
 	}
 
-	entries := r.codexModelEntries()
+	entries := r.addedModelEntries()
 	for _, entry := range entries {
 		body, _ = sjson.SetRawBytes(body, "data.-1", entry)
 	}
@@ -83,22 +83,25 @@ func (r *Router) writeModelList(w http.ResponseWriter, upstreamBody []byte) {
 	_, _ = w.Write(body)
 }
 
-// codexModelEntries renders the added models as Anthropic model objects.
-func (r *Router) codexModelEntries() [][]byte {
+// addedModelEntries renders every provider's models as Anthropic model
+// objects.
+func (r *Router) addedModelEntries() [][]byte {
 	entries := make([][]byte, 0, 16)
-	for _, id := range r.registry.AdvertisedIDs() {
-		entry := []byte(`{"type":"model","id":"","display_name":"","created_at":""}`)
-		entry, _ = sjson.SetBytes(entry, "id", id)
-		entry, _ = sjson.SetBytes(entry, "display_name", displayNameFor(r.registry, id))
-		entry, _ = sjson.SetBytes(entry, "created_at", codexModelCreatedAt)
-		entries = append(entries, entry)
+	for _, provider := range r.providers {
+		for _, id := range provider.Registry.AdvertisedIDs() {
+			entry := []byte(`{"type":"model","id":"","display_name":"","created_at":""}`)
+			entry, _ = sjson.SetBytes(entry, "id", id)
+			entry, _ = sjson.SetBytes(entry, "display_name", displayNameFor(provider.Registry, id))
+			entry, _ = sjson.SetBytes(entry, "created_at", addedModelCreatedAt)
+			entries = append(entries, entry)
+		}
 	}
 	return entries
 }
 
 // displayNameFor labels a model id, appending the reasoning effort when the id
 // is an effort variant.
-func displayNameFor(registry *codex.Registry, id string) string {
+func displayNameFor(registry *catalog.Registry, id string) string {
 	resolution, ok := registry.Resolve(id)
 	if !ok {
 		return id

@@ -28,6 +28,8 @@ type callState struct {
 // Messages SSE stream Claude Code consumes. One instance handles one response
 // and is not safe for concurrent use.
 type StreamTranslator struct {
+	// dialect decides how the reasoning of this backend is signed.
+	dialect Dialect
 	// clientModel is echoed back so the client sees the name it requested
 	// rather than the upstream slug.
 	clientModel string
@@ -53,11 +55,18 @@ type StreamTranslator struct {
 	active *callState
 }
 
-// NewStreamTranslator returns a translator for one response. clientModel is
-// the model name the client asked for; toolNames maps upstream (shortened)
+// NewStreamTranslator returns a translator for one Codex response. clientModel
+// is the model name the client asked for; toolNames maps upstream (shortened)
 // tool names to the client's original names.
 func NewStreamTranslator(clientModel string, toolNames map[string]string) *StreamTranslator {
+	return Codex.NewStreamTranslator(clientModel, toolNames)
+}
+
+// NewStreamTranslator returns a translator for one response from this
+// dialect's backend, as the package-level NewStreamTranslator does for Codex.
+func (d Dialect) NewStreamTranslator(clientModel string, toolNames map[string]string) *StreamTranslator {
 	return &StreamTranslator{
+		dialect:     d.orDefault(),
 		clientModel: clientModel,
 		toolNames:   toolNames,
 		calls:       map[string]*callState{},
@@ -94,7 +103,9 @@ func (t *StreamTranslator) Event(payload []byte) []byte {
 		}
 		t.thinkingSeen = true
 
-	case "response.reasoning_summary_text.delta":
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		// Codex streams a summary of its reasoning; OpenRouter streams the
+		// reasoning text itself. Both become the thinking block.
 		out = append(out, t.ensureStarted()...)
 		out = append(out, t.closeText()...)
 		out = append(out, t.openThinking()...)
@@ -377,10 +388,10 @@ func (t *StreamTranslator) closeThinking() []byte {
 		return nil
 	}
 	out := make([]byte, 0, 256)
-	if t.thinkingSignature != "" {
+	if signature := t.dialect.sign(t.thinkingSignature); signature != "" {
 		frame := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":""}}`)
 		frame, _ = sjson.SetBytes(frame, "index", t.blockIndex)
-		frame, _ = sjson.SetBytes(frame, "delta.signature", MarkSignature(t.thinkingSignature))
+		frame, _ = sjson.SetBytes(frame, "delta.signature", signature)
 		out = append(out, sseFrame("content_block_delta", frame)...)
 	}
 	out = append(out, t.blockStop(t.blockIndex)...)
@@ -594,7 +605,7 @@ func (t *StreamTranslator) adoptTerminalContent(response gjson.Result) []byte {
 				return true
 			}
 			var thinking strings.Builder
-			item.Get("summary").ForEach(func(_, part gjson.Result) bool {
+			appendParts := func(_, part gjson.Result) bool {
 				if text := part.Get("text").String(); text != "" {
 					if thinking.Len() > 0 {
 						thinking.WriteString(summarySeparator)
@@ -602,7 +613,10 @@ func (t *StreamTranslator) adoptTerminalContent(response gjson.Result) []byte {
 					thinking.WriteString(text)
 				}
 				return true
-			})
+			}
+			item.Get("summary").ForEach(appendParts)
+			// OpenRouter reports the reasoning itself as content parts.
+			item.Get("content").ForEach(appendParts)
 			signature := item.Get("encrypted_content").String()
 			if thinking.Len() == 0 && signature == "" {
 				return true

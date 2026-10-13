@@ -51,6 +51,11 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("codex: backend returned %d: %s", e.StatusCode, strings.TrimSpace(string(e.Body)))
 }
 
+// HTTPStatus and ResponseBody let callers handle the errors of every
+// provider alike.
+func (e *APIError) HTTPStatus() int      { return e.StatusCode }
+func (e *APIError) ResponseBody() []byte { return e.Body }
+
 // Responses posts a Responses API request and returns the streaming
 // response. The caller owns the body and must close it.
 func (b *Backend) Responses(ctx context.Context, body []byte, sessionID string) (*http.Response, error) {

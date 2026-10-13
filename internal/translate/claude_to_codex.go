@@ -41,6 +41,8 @@ type Options struct {
 	Effort string
 	// DefaultEffort is used when neither Effort nor the request implies one.
 	DefaultEffort string
+	// Dialect is the backend the request is for; the zero value is Codex.
+	Dialect Dialect
 }
 
 // ClaudeToCodex translates an Anthropic Messages request into a Codex
@@ -59,7 +61,7 @@ func ClaudeToCodex(opts Options, raw []byte) (*Request, error) {
 
 	items := make([][]byte, 0, 16)
 	items = appendSystemItem(items, root.Get("system"))
-	items = appendMessageItems(items, root.Get("messages"), shortNames)
+	items = appendMessageItems(items, root.Get("messages"), shortNames, opts.Dialect.orDefault())
 	body = setRawArray(body, "input", items)
 
 	if tools := root.Get("tools"); tools.IsArray() {
@@ -132,7 +134,7 @@ func appendSystemItem(items [][]byte, system gjson.Result) [][]byte {
 	return append(items, message)
 }
 
-func appendMessageItems(items [][]byte, messages gjson.Result, shortNames map[string]string) [][]byte {
+func appendMessageItems(items [][]byte, messages gjson.Result, shortNames map[string]string, dialect Dialect) [][]byte {
 	if !messages.IsArray() {
 		return items
 	}
@@ -180,17 +182,12 @@ func appendMessageItems(items [][]byte, messages gjson.Result, shortNames map[st
 					parts = append(parts, part)
 				}
 			case "thinking":
-				// Only reasoning state this proxy produced can be replayed to
-				// Codex; anything else is dropped rather than rejected upstream.
-				signature := block.Get("signature").String()
-				encrypted, ok := stripSignatureMarker(signature)
-				if !ok || encrypted == "" {
-					continue
+				// Only reasoning this backend produced can be replayed to it;
+				// anything else is dropped rather than rejected upstream.
+				if item, ok := reasoningItem(block, dialect); ok {
+					flush()
+					items = append(items, item)
 				}
-				flush()
-				item := []byte(`{"type":"reasoning","summary":[],"content":null}`)
-				item, _ = sjson.SetBytes(item, "encrypted_content", encrypted)
-				items = append(items, item)
 			case "tool_use":
 				flush()
 				items = append(items, functionCallItem(block, shortNames))
@@ -623,20 +620,31 @@ func shortenCallID(id string) string {
 	return id[:nameLimit-len(suffix)] + suffix
 }
 
-// MarkSignature tags Codex reasoning state as this proxy's own.
-func MarkSignature(encrypted string) string {
-	if encrypted == "" {
-		return ""
+// reasoningItem turns a thinking block back into the reasoning item the
+// backend produced it from: its encrypted state when it has one, otherwise
+// its text when the dialect can replay text.
+func reasoningItem(block gjson.Result, dialect Dialect) ([]byte, bool) {
+	encrypted, ok := dialect.unwrap(block.Get("signature").String())
+	if !ok {
+		return nil, false
 	}
-	return SignatureMarker + encrypted
+	if encrypted != "" {
+		item := []byte(`{"type":"reasoning","summary":[],"content":null}`)
+		item, _ = sjson.SetBytes(item, "encrypted_content", encrypted)
+		return item, true
+	}
+	text := block.Get("thinking").String()
+	if !dialect.ReplayText || strings.TrimSpace(text) == "" {
+		return nil, false
+	}
+	item := []byte(`{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":""}]}`)
+	item, _ = sjson.SetBytes(item, "content.0.text", text)
+	return item, true
 }
 
-// stripSignatureMarker removes the marker, reporting whether it was present.
-func stripSignatureMarker(signature string) (string, bool) {
-	if !strings.HasPrefix(signature, SignatureMarker) {
-		return "", false
-	}
-	return strings.TrimPrefix(signature, SignatureMarker), true
+// MarkSignature tags Codex reasoning state as this proxy's own.
+func MarkSignature(encrypted string) string {
+	return Codex.sign(encrypted)
 }
 
 func joinRawArray(items [][]byte) []byte {

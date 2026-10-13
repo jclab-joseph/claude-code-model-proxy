@@ -14,6 +14,7 @@ import (
 
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/codex"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/config"
+	"github.com/jclab-joseph/claude-code-model-proxy/internal/openrouter"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/translate"
 	"github.com/tidwall/gjson"
 )
@@ -30,17 +31,28 @@ type recorded struct {
 // harness wires a Router against a fake Anthropic API and a fake Codex
 // backend so the whole request path can be exercised without network access.
 type harness struct {
-	router    *Router
-	anthropic *recorded
-	codex     *recorded
+	router     *Router
+	anthropic  *recorded
+	codex      *recorded
+	openrouter *recorded
 }
+
+// testOpenRouterKey is the API key the harness configures for OpenRouter.
+const testOpenRouterKey = "sk-or-test"
 
 // newHarness builds the harness. anthropicHandler and codexHandler produce the
 // fake upstream responses; either may be nil for a default.
 func newHarness(t *testing.T, anthropicHandler, codexHandler http.HandlerFunc, authenticate bool) *harness {
 	t.Helper()
+	return newHarnessWithOpenRouter(t, anthropicHandler, codexHandler, nil, authenticate)
+}
 
-	h := &harness{anthropic: &recorded{}, codex: &recorded{}}
+// newHarnessWithOpenRouter is newHarness with a handler for the fake
+// OpenRouter Responses endpoint as well; nil streams an empty response.
+func newHarnessWithOpenRouter(t *testing.T, anthropicHandler, codexHandler, orHandler http.HandlerFunc, authenticate bool) *harness {
+	t.Helper()
+
+	h := &harness{anthropic: &recorded{}, codex: &recorded{}, openrouter: &recorded{}}
 
 	record := func(into *recorded, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -75,6 +87,18 @@ func newHarness(t *testing.T, anthropicHandler, codexHandler http.HandlerFunc, a
 	}))
 	t.Cleanup(codexServer.Close)
 
+	if orHandler == nil {
+		orHandler = func(w http.ResponseWriter, r *http.Request) {
+			writeSSE(w, `{"type":"response.created","response":{"id":"gen-test"}}`)
+			writeSSE(w, `{"type":"response.completed","response":{"id":"gen-test","usage":{}}}`)
+		}
+	}
+	openRouterServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		record(h.openrouter, r)
+		orHandler(w, r)
+	}))
+	t.Cleanup(openRouterServer.Close)
+
 	cfg := config.Default()
 	cfg.Upstream = anthropicServer.URL
 	cfg.Codex.BaseURL = codexServer.URL
@@ -103,7 +127,14 @@ func newHarness(t *testing.T, anthropicHandler, codexHandler http.HandlerFunc, a
 	backend := codex.NewBackend(cfg.Codex.BaseURL, "test-agent", "codex-tui", store, nil)
 	registry := codex.NewRegistry(nil, "", true)
 
-	router, err := New(cfg, registry, backend, nil, []byte("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n"))
+	orModels, _ := openrouter.Models([]config.OpenRouterModel{{ID: "z-ai/glm-5.3-flash"}}, nil)
+	orClient := openrouter.NewClient(openRouterServer.URL, testOpenRouterKey, map[string]any{"sort": "price"}, nil)
+	providers := []*Provider{
+		{Name: "codex", Registry: registry, Dialect: translate.Codex, Upstream: backend, Ready: store.Authenticated},
+		{Name: "openrouter", Registry: openrouter.NewRegistry(orModels, ""), Dialect: translate.OpenRouter, Upstream: orClient, Ready: orClient.Ready},
+	}
+
+	router, err := New(cfg, providers, nil, []byte("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n"))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -190,6 +221,8 @@ func TestModelListForwardsUpstreamErrorWithoutCodexLogin(t *testing.T) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"no key"}}`))
 	}, nil, false)
+	// With no provider able to serve, there is nothing to list instead.
+	h.router.providers = h.router.providers[:1]
 
 	rec := h.do(t, http.MethodGet, "/v1/models", "")
 	if rec.Code != http.StatusUnauthorized {

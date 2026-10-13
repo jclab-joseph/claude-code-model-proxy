@@ -3,6 +3,8 @@ package codex
 import (
 	"strings"
 	"testing"
+
+	"github.com/jclab-joseph/claude-code-model-proxy/internal/catalog"
 )
 
 func TestResolveBareModel(t *testing.T) {
@@ -254,7 +256,7 @@ func TestClampEffort(t *testing.T) {
 	}
 
 	cases := []struct {
-		model  Model
+		model  catalog.Model
 		effort string
 		want   string
 	}{

@@ -52,6 +52,64 @@ type Codex struct {
 	UseCLIAuth bool `json:"use_codex_cli_auth" yaml:"use_codex_cli_auth"`
 }
 
+// OpenRouter groups the settings of the OpenRouter backend, reached over its
+// Responses API with an API key.
+type OpenRouter struct {
+	// BaseURL is the API root; the Responses and model list endpoints hang
+	// off it.
+	BaseURL string `json:"base_url" yaml:"base_url"`
+	// APIKey is the key itself. Prefer APIKeyEnv, which keeps the secret out
+	// of the file; APIKey wins when both are set.
+	APIKey string `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	// APIKeyEnv names the environment variable holding the key.
+	APIKeyEnv string `json:"api_key_env" yaml:"api_key_env"`
+	// ModelPrefix, when set, is accepted (and advertised) in front of every
+	// model id. openrouter/ is accepted when it is not set.
+	ModelPrefix string `json:"model_prefix,omitempty" yaml:"model_prefix,omitempty"`
+	// Provider is sent as the request's provider routing preferences. Its
+	// data_collection is always "deny": prompts must not reach a provider
+	// that may retain or train on them, so any other value is refused at
+	// load time.
+	Provider map[string]any `json:"provider,omitempty" yaml:"provider,omitempty"`
+	// Models are the OpenRouter models to add. The provider is off when the
+	// list is empty.
+	Models []OpenRouterModel `json:"models,omitempty" yaml:"models,omitempty"`
+}
+
+// OpenRouterModel names one OpenRouter model to add. Only ID is required; the
+// context window, output limit and capabilities come from OpenRouter's model
+// list.
+type OpenRouterModel struct {
+	// ID is the OpenRouter model id, for example z-ai/glm-5.3-flash.
+	ID          string `json:"id" yaml:"id"`
+	DisplayName string `json:"display_name,omitempty" yaml:"display_name,omitempty"`
+	Description string `json:"description,omitempty" yaml:"description,omitempty"`
+	// BehavesAs is the Claude model whose client-side handling Claude Code
+	// applies; see catalog.Model. Defaults to claude-sonnet-5.
+	BehavesAs string `json:"behaves_as,omitempty" yaml:"behaves_as,omitempty"`
+	// DefaultEffort applies when the client asks for none.
+	DefaultEffort string `json:"default_effort,omitempty" yaml:"default_effort,omitempty"`
+}
+
+// DataCollectionDeny is the only data_collection policy OpenRouter requests
+// are sent with.
+const DataCollectionDeny = "deny"
+
+// Key reports the OpenRouter API key: APIKey, or else the environment
+// variable APIKeyEnv names.
+func (o OpenRouter) Key() string {
+	if key := strings.TrimSpace(o.APIKey); key != "" {
+		return key
+	}
+	if o.APIKeyEnv == "" {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv(o.APIKeyEnv))
+}
+
+// Enabled reports whether any OpenRouter model is configured.
+func (o OpenRouter) Enabled() bool { return len(o.Models) > 0 }
+
 // DNS configures the proxy's own resolver, which is used for every outbound
 // connection.
 //
@@ -124,8 +182,9 @@ type Config struct {
 	// API one, and the shape can change with any Claude Code release.
 	ExperimentalModifyBootstrapModels bool `json:"-" yaml:"-"`
 
-	Codex Codex `json:"codex" yaml:"codex"`
-	DNS   DNS   `json:"dns" yaml:"dns"`
+	Codex      Codex      `json:"codex" yaml:"codex"`
+	OpenRouter OpenRouter `json:"openrouter" yaml:"openrouter"`
+	DNS        DNS        `json:"dns" yaml:"dns"`
 
 	// path records where the config was loaded from, for Save.
 	path string `json:"-" yaml:"-"`
@@ -222,6 +281,10 @@ func Default() *Config {
 			CallbackPort:   1455,
 			UseCLIAuth:     true,
 		},
+		OpenRouter: OpenRouter{
+			BaseURL:   "https://openrouter.ai/api/v1",
+			APIKeyEnv: "OPENROUTER_API_KEY",
+		},
 		DNS: DNS{
 			Enabled:       true,
 			TimeoutMS:     5000,
@@ -262,7 +325,23 @@ func Load(path string) (*Config, error) {
 	cfg.disableUnlistedListeners(present)
 
 	cfg.normalize()
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("config: %s: %w", path, err)
+	}
 	return cfg, nil
+}
+
+// validate rejects settings that normalize cannot repair.
+func (c *Config) validate() error {
+	if policy, ok := c.OpenRouter.Provider["data_collection"]; ok && policy != DataCollectionDeny {
+		return fmt.Errorf("openrouter.provider.data_collection must be %q, got %v", DataCollectionDeny, policy)
+	}
+	for i, model := range c.OpenRouter.Models {
+		if model.ID == "" {
+			return fmt.Errorf("openrouter.models[%d] has no id", i)
+		}
+	}
+	return nil
 }
 
 // decode fills cfg from data in the format path names and reports which
@@ -357,6 +436,19 @@ func (c *Config) normalize() {
 	}
 	if prefix := strings.TrimSpace(c.Codex.ModelPrefix); prefix != "" {
 		c.Codex.ModelPrefix = strings.TrimSuffix(prefix, "/") + "/"
+	}
+	if strings.TrimSpace(c.OpenRouter.BaseURL) == "" {
+		c.OpenRouter.BaseURL = def.OpenRouter.BaseURL
+	}
+	c.OpenRouter.BaseURL = strings.TrimSuffix(strings.TrimSpace(c.OpenRouter.BaseURL), "/")
+	if strings.TrimSpace(c.OpenRouter.APIKeyEnv) == "" {
+		c.OpenRouter.APIKeyEnv = def.OpenRouter.APIKeyEnv
+	}
+	if prefix := strings.TrimSpace(c.OpenRouter.ModelPrefix); prefix != "" {
+		c.OpenRouter.ModelPrefix = strings.TrimSuffix(prefix, "/") + "/"
+	}
+	for i := range c.OpenRouter.Models {
+		c.OpenRouter.Models[i].ID = strings.TrimSpace(c.OpenRouter.Models[i].ID)
 	}
 	if c.DNS.TimeoutMS <= 0 {
 		c.DNS.TimeoutMS = def.DNS.TimeoutMS

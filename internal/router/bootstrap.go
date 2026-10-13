@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/jclab-joseph/claude-code-model-proxy/internal/catalog"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/logx"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -68,7 +69,10 @@ func (r *Router) injectBootstrapModels(body []byte, status int, header http.Head
 		return nil, false
 	}
 
-	options := r.registry.BootstrapOptions()
+	var options []catalog.BootstrapOption
+	for _, provider := range r.providers {
+		options = append(options, provider.Registry.BootstrapOptions()...)
+	}
 	if len(options) == 0 {
 		return nil, false
 	}

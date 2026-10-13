@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/jclab-joseph/claude-code-model-proxy/internal/codex"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/config"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/logx"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/translate"
@@ -24,9 +23,9 @@ const maxRequestBody = 64 << 20
 
 // Router implements http.Handler for the intercepted Anthropic endpoints.
 type Router struct {
-	cfg      *config.Config
-	registry *codex.Registry
-	backend  *codex.Backend
+	cfg *config.Config
+	// providers answer the requests for the added models, asked in order.
+	providers []*Provider
 
 	upstream *url.URL
 	proxy    *httputil.ReverseProxy
@@ -37,9 +36,10 @@ type Router struct {
 	caPEM []byte
 }
 
-// New builds a router. transport carries pass-through traffic to the upstream
-// API and must not itself route through this proxy. caPEM may be nil.
-func New(cfg *config.Config, registry *codex.Registry, backend *codex.Backend, transport http.RoundTripper, caPEM []byte) (*Router, error) {
+// New builds a router. providers answer for the added models and are asked in
+// order. transport carries pass-through traffic to the upstream API and must
+// not itself route through this proxy. caPEM may be nil.
+func New(cfg *config.Config, providers []*Provider, transport http.RoundTripper, caPEM []byte) (*Router, error) {
 	upstream, err := url.Parse(cfg.Upstream)
 	if err != nil {
 		return nil, fmt.Errorf("router: parse upstream %q: %w", cfg.Upstream, err)
@@ -49,12 +49,11 @@ func New(cfg *config.Config, registry *codex.Registry, backend *codex.Backend, t
 	}
 
 	r := &Router{
-		cfg:      cfg,
-		registry: registry,
-		backend:  backend,
-		upstream: upstream,
-		client:   &http.Client{Transport: transport},
-		caPEM:    caPEM,
+		cfg:       cfg,
+		providers: providers,
+		upstream:  upstream,
+		client:    &http.Client{Transport: transport},
+		caPEM:     caPEM,
 	}
 
 	r.proxy = &httputil.ReverseProxy{
@@ -105,8 +104,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	r.proxy.ServeHTTP(w, req)
 }
 
-// serveMessages routes a Messages request either to the Codex backend or to
-// Anthropic, based on the model the body names.
+// serveMessages routes a Messages request either to the provider of an added
+// model or to Anthropic, based on the model the body names.
 func (r *Router) serveMessages(w http.ResponseWriter, req *http.Request) {
 	body, err := readBody(req)
 	if err != nil {
@@ -115,8 +114,8 @@ func (r *Router) serveMessages(w http.ResponseWriter, req *http.Request) {
 	}
 
 	model := gjson.GetBytes(body.JSON, "model").String()
-	resolution, isCodex := r.registry.Resolve(model)
-	if !isCodex {
+	provider, resolution, added := r.resolve(model)
+	if !added {
 		if model == "" && body.Compressed() && !body.Readable() {
 			// Worth saying out loud: an unreadable body is why a request for
 			// an added model would silently go to Anthropic instead.
@@ -136,18 +135,18 @@ func (r *Router) serveMessages(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if gjson.GetBytes(body.JSON, "thread.type").String() == "continue" {
-		logx.Infof("codex messages model=%s: refusing a thread continue so the client resends the full conversation", model)
+		logx.Infof("%s messages model=%s: refusing a thread continue so the client resends the full conversation", provider.Name, model)
 		writeThreadUnsupported(w)
 		return
 	}
 
 	effort := resolveEffort(body.JSON, resolution)
-	logx.Infof("codex messages model=%s -> %s effort=%s (%s body)",
-		model, resolution.Model.ID, effort, bodyEncodingLabel(body))
-	r.serveCodexMessages(w, req, body.JSON, resolution, effort)
+	logx.Infof("%s messages model=%s -> %s effort=%s (%s body)",
+		provider.Name, model, resolution.Model.ID, effort, bodyEncodingLabel(body))
+	r.serveProviderMessages(w, req, provider, body.JSON, resolution, effort)
 }
 
-// serveCountTokens answers token counts for Codex models locally and lets
+// serveCountTokens answers token counts for the added models locally and lets
 // Anthropic answer for its own.
 func (r *Router) serveCountTokens(w http.ResponseWriter, req *http.Request) {
 	body, err := readBody(req)
@@ -157,7 +156,7 @@ func (r *Router) serveCountTokens(w http.ResponseWriter, req *http.Request) {
 	}
 
 	model := gjson.GetBytes(body.JSON, "model").String()
-	if _, isCodex := r.registry.Resolve(model); !isCodex {
+	if _, _, added := r.resolve(model); !added {
 		if cleaned, changed := translate.StripProxySignatures(body.JSON); changed {
 			body.forwardModified(req, cleaned)
 		} else {
@@ -167,7 +166,7 @@ func (r *Router) serveCountTokens(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	r.writeCodexTokenCount(w, body.JSON)
+	r.writeLocalTokenCount(w, body.JSON)
 }
 
 func (r *Router) serveAdmin(w http.ResponseWriter, req *http.Request) {
@@ -181,12 +180,25 @@ func (r *Router) serveAdmin(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Disposition", `attachment; filename="ccmproxy-ca.crt"`)
 		_, _ = w.Write(r.caPEM)
 	case "/__ccmproxy/status":
+		providers := make([]map[string]any, 0, len(r.providers))
 		status := map[string]any{
 			"upstream":        r.cfg.Upstream,
 			"intercept_hosts": r.cfg.InterceptHosts,
-			"codex_models":    r.registry.AdvertisedIDs(),
-			"codex_logged_in": r.backend != nil && r.backend.Store.Authenticated(),
 		}
+		for _, provider := range r.providers {
+			providers = append(providers, map[string]any{
+				"name":   provider.Name,
+				"models": provider.Registry.AdvertisedIDs(),
+				"ready":  provider.ready(),
+			})
+			// The codex_ keys predate providers and are kept for whatever
+			// already reads them.
+			if provider.Name == "codex" {
+				status["codex_models"] = provider.Registry.AdvertisedIDs()
+				status["codex_logged_in"] = provider.ready()
+			}
+		}
+		status["providers"] = providers
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(status)
 	default:

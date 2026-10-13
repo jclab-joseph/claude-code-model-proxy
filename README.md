@@ -1,8 +1,9 @@
 # claude-code-model-proxy (`ccmproxy`)
 
 Adds OpenAI **Codex** models to Claude Code, paid for by your ChatGPT
-subscription. They show up in `/model` next to the Claude models, and
-everything else still goes to Anthropic untouched.
+subscription, and any **OpenRouter** model you name, paid for by an OpenRouter
+API key. They show up in `/model` next to the Claude models, and everything
+else still goes to Anthropic untouched.
 
 ![Claude Code's /model picker listing the Codex models alongside the Claude ones](docs/img1.png)
 
@@ -99,10 +100,17 @@ exceptions:
 2. **Requests naming an added model** — these are translated and sent to that
    model's own provider instead of Anthropic.
 
-The added models are OpenAI's **Codex** models, reached through a ChatGPT
-subscription over OAuth 2.0 (authorization code + PKCE), the same way the Codex
-CLI does. The OAuth and Responses API details follow
-[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
+The added models come from two providers, both reached over the OpenAI
+Responses API:
+
+- OpenAI's **Codex** models, through a ChatGPT subscription over OAuth 2.0
+  (authorization code + PKCE), the same way the Codex CLI does. The OAuth and
+  Responses API details follow
+  [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
+- **OpenRouter** models, with an API key; see [OpenRouter](#openrouter).
+
+Subagents keep their own model, so a session can run its main agent on an
+added model and delegate to a Claude subagent, or the other way round.
 
 The certificates are created once and reused, so the anchor you trust keeps
 working — and the CA's *private* key is never stored.
@@ -462,6 +470,42 @@ instead of being overwritten with a stale one.
 `~/.codex/auth.json`; `ccmproxy logout codex` likewise removes only its own.
 Set `codex.use_codex_cli_auth` to `false` to ignore the CLI's file entirely.
 
+## OpenRouter
+
+Name the models to add under `openrouter.models` and put the API key in
+`OPENROUTER_API_KEY`. The provider is off while the list is empty.
+
+```yaml
+openrouter:
+  # api_key_env: OPENROUTER_API_KEY   # the variable the key is read from
+  # model_prefix: ""                  # openrouter/ is accepted regardless
+  # provider:                         # OpenRouter provider routing, sent as is
+  #   sort: price
+  models:
+    - id: z-ai/glm-5.3-flash
+      # behaves_as: claude-sonnet-5   # the Claude model Claude Code treats it as
+      # display_name, description, default_effort
+```
+
+Select it with `/model z-ai/glm-5.3-flash` (or `openrouter/z-ai/glm-5.3-flash`).
+
+- **Data collection is always denied.** Every request carries
+  `provider.data_collection: deny`, so OpenRouter only routes to providers that
+  do not retain or train on prompts. It is set after the configured
+  preferences, and a configuration asking for anything else is refused at
+  startup.
+- **Only the key goes to OpenRouter.** The request is built from scratch with
+  the OpenRouter key, so Claude Code's Anthropic credentials never leave for
+  OpenRouter.
+- **Model details come from OpenRouter.** The context window, output limit,
+  image input and reasoning support are read from OpenRouter's public model
+  list at startup. Without it the configured models are still offered, with
+  conservative defaults, and a warning names a model OpenRouter does not list
+  or that cannot call tools — Claude Code cannot work without them.
+- **Reasoning** streams back as thinking blocks and is replayed to OpenRouter
+  as reasoning text on the next turn. It is marked as OpenRouter's, so it is
+  never sent to Anthropic or Codex after a model switch.
+
 ## Commands
 
 ```
@@ -524,6 +568,11 @@ codex:
   callback_port: 1455
   auth_file: ""
   use_codex_cli_auth: true
+openrouter:
+  base_url: https://openrouter.ai/api/v1
+  api_key_env: OPENROUTER_API_KEY
+  provider: {}          # data_collection is always deny
+  models: []            # see OpenRouter
 dns:
   enabled: true
   servers: []
@@ -625,6 +674,9 @@ The suite runs the whole path without network access:
   schema requires is present, that a null or absent option list is handled,
   and that a compressed, non-JSON, misshapen or failed response is forwarded
   byte for byte instead.
+- OpenRouter against a fake endpoint: that only the OpenRouter key is sent,
+  that `data_collection` is `deny` whatever the configuration says, and that
+  each provider replays only its own reasoning.
 
 ## Security notes
 

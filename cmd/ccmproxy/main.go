@@ -27,13 +27,16 @@ import (
 	"time"
 
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/ca"
+	"github.com/jclab-joseph/claude-code-model-proxy/internal/catalog"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/codex"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/config"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/httplog"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/logx"
+	"github.com/jclab-joseph/claude-code-model-proxy/internal/openrouter"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/proxy"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/resolve"
 	"github.com/jclab-joseph/claude-code-model-proxy/internal/router"
+	"github.com/jclab-joseph/claude-code-model-proxy/internal/translate"
 )
 
 const usage = `ccmproxy - add models to Claude Code by proxying the Anthropic API
@@ -242,12 +245,9 @@ func runServe(args []string) error {
 	// transport, so wrapping it here logs all of them with one change.
 	transport := &httplog.Transport{Next: directTransport(resolverOrNil(resolver))}
 
-	oauth := codex.NewClient(&http.Client{Transport: transport, Timeout: 30 * time.Second})
-	store := codex.NewStore(oauth, storeOptions(cfg))
-	backend := codex.NewBackend(cfg.Codex.BaseURL, cfg.Codex.UserAgent, cfg.Codex.Originator, store, transport)
-	registry := codex.NewRegistry(cfg.Codex.Models, cfg.Codex.ModelPrefix, cfg.Codex.EffortVariants)
+	providers, store := buildProviders(context.Background(), cfg, transport)
 
-	handler, err := router.New(cfg, registry, backend, transport, authority.CertPEM())
+	handler, err := router.New(cfg, providers, transport, authority.CertPEM())
 	if err != nil {
 		return err
 	}
@@ -268,8 +268,12 @@ func runServe(args []string) error {
 	logx.Infof("upstream: %s", cfg.Upstream)
 	logx.Infof("intercepting: %s", strings.Join(cfg.InterceptHosts, ", "))
 	if cfg.ExperimentalModifyBootstrapModels {
+		count := 0
+		for _, provider := range providers {
+			count += len(provider.Registry.BootstrapOptions())
+		}
 		logx.Warnf("experimental: rewriting %s to add %d models to the /model picker",
-			"/api/claude_cli/bootstrap", len(registry.BootstrapOptions()))
+			"/api/claude_cli/bootstrap", count)
 	}
 	if resolver != nil {
 		logx.Infof("dns: resolving upstream names with %s", strings.Join(resolver.Servers(), ", "))
@@ -282,6 +286,16 @@ func runServe(args []string) error {
 		}
 	} else {
 		logx.Warnf("no Codex credentials yet; run `ccmproxy login codex` to enable the added models")
+	}
+	for _, provider := range providers {
+		if provider.Name != "openrouter" {
+			continue
+		}
+		logx.Infof("openrouter: %s (data_collection=%s)",
+			strings.Join(provider.Registry.AdvertisedIDs(), ", "), config.DataCollectionDeny)
+		if cfg.OpenRouter.Key() == "" {
+			logx.Warnf("openrouter: no API key; set %s", cfg.OpenRouter.APIKeyEnv)
+		}
 	}
 
 	for _, listener := range cfg.ListenerSummary() {
@@ -451,6 +465,19 @@ func runStatus(args []string) error {
 		fmt.Printf("dns             %s\n", strings.Join(resolver.Servers(), ", "))
 	}
 
+	if cfg.OpenRouter.Enabled() {
+		ids := make([]string, 0, len(cfg.OpenRouter.Models))
+		for _, model := range cfg.OpenRouter.Models {
+			ids = append(ids, model.ID)
+		}
+		key := "missing"
+		if cfg.OpenRouter.Key() != "" {
+			key = "set"
+		}
+		fmt.Printf("openrouter      %s (data_collection=%s)\n", strings.Join(ids, ", "), config.DataCollectionDeny)
+		fmt.Printf("openrouter key  %s (%s)\n", key, cfg.OpenRouter.APIKeyEnv)
+	}
+
 	store := codex.NewStore(nil, storeOptions(cfg))
 	fmt.Printf("codex sources   %s\n", strings.Join(store.Sources(), ", "))
 	token, err := store.Peek()
@@ -477,28 +504,87 @@ func runModels(args []string) error {
 	if err != nil {
 		return err
 	}
-	registry := codex.NewRegistry(cfg.Codex.Models, cfg.Codex.ModelPrefix, cfg.Codex.EffortVariants)
+	registries := []*catalog.Registry{codex.NewRegistry(cfg.Codex.Models, cfg.Codex.ModelPrefix, cfg.Codex.EffortVariants)}
+	if cfg.OpenRouter.Enabled() {
+		resolver, err := newResolver(cfg)
+		if err != nil {
+			return err
+		}
+		registries = append(registries, openRouterRegistry(context.Background(), cfg, directTransport(resolverOrNil(resolver))))
+	}
 
+	var rows []catalog.PickerRow
+	var options []catalog.BootstrapOption
+	for _, registry := range registries {
+		rows = append(rows, registry.PickerOptions()...)
+		options = append(options, registry.BootstrapOptions()...)
+	}
 	switch {
 	case settingsJSON:
-		return printSettingsJSON(registry)
+		return printSettingsJSON(rows)
 	case bootstrapJSON:
-		return printJSON(map[string]any{"additional_model_options": registry.BootstrapOptions()})
+		return printJSON(map[string]any{"additional_model_options": options})
 	}
 
-	for _, row := range registry.PickerOptions() {
-		resolution, ok := registry.Resolve(row.Model)
-		if !ok {
-			continue
+	for _, registry := range registries {
+		for _, row := range registry.PickerOptions() {
+			resolution, ok := registry.Resolve(row.Model)
+			if !ok {
+				continue
+			}
+			effort := resolution.Effort
+			if effort == "" {
+				effort = resolution.Model.DefaultEffort + " (default)"
+			}
+			fmt.Printf("%-28s %-24s context %7d  effort %-16s behaves as %s\n",
+				row.Model, resolution.Model.ID, resolution.Model.ContextLength, effort, row.BehavesAs)
 		}
-		effort := resolution.Effort
-		if effort == "" {
-			effort = resolution.Model.DefaultEffort + " (default)"
-		}
-		fmt.Printf("%-28s %-24s context %7d  effort %-16s behaves as %s\n",
-			row.Model, resolution.Model.ID, resolution.Model.ContextLength, effort, row.BehavesAs)
 	}
 	return nil
+}
+
+// buildProviders wires every provider of added models, in the order the
+// router asks them. The Codex store is returned for the startup report.
+func buildProviders(ctx context.Context, cfg *config.Config, transport http.RoundTripper) ([]*router.Provider, *codex.Store) {
+	oauth := codex.NewClient(&http.Client{Transport: transport, Timeout: 30 * time.Second})
+	store := codex.NewStore(oauth, storeOptions(cfg))
+	backend := codex.NewBackend(cfg.Codex.BaseURL, cfg.Codex.UserAgent, cfg.Codex.Originator, store, transport)
+	providers := []*router.Provider{{
+		Name:     "codex",
+		Registry: codex.NewRegistry(cfg.Codex.Models, cfg.Codex.ModelPrefix, cfg.Codex.EffortVariants),
+		Dialect:  translate.Codex,
+		Upstream: backend,
+		Ready:    store.Authenticated,
+	}}
+
+	if cfg.OpenRouter.Enabled() {
+		client := openrouter.NewClient(cfg.OpenRouter.BaseURL, cfg.OpenRouter.Key(), cfg.OpenRouter.Provider, transport)
+		providers = append(providers, &router.Provider{
+			Name:     "openrouter",
+			Registry: openRouterRegistry(ctx, cfg, transport),
+			Dialect:  translate.OpenRouter,
+			Upstream: client,
+			Ready:    client.Ready,
+		})
+	}
+	return providers, store
+}
+
+// openRouterRegistry builds the OpenRouter catalog from the configured models,
+// filled in from OpenRouter's model list when it can be fetched.
+func openRouterRegistry(ctx context.Context, cfg *config.Config, transport http.RoundTripper) *catalog.Registry {
+	fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	info, err := openrouter.FetchModels(fetchCtx, &http.Client{Transport: transport}, cfg.OpenRouter.BaseURL)
+	if err != nil {
+		logx.Warnf("openrouter: %v; using the configured model settings only", err)
+		info = nil
+	}
+	models, warnings := openrouter.Models(cfg.OpenRouter.Models, info)
+	for _, warning := range warnings {
+		logx.Warnf("openrouter: %s", warning)
+	}
+	return openrouter.NewRegistry(models, cfg.OpenRouter.ModelPrefix)
 }
 
 // printSettingsJSON emits the settings.json fragment that puts the added
@@ -507,10 +593,10 @@ func runModels(args []string) error {
 // This is the client-side half of the integration and needs no cooperation
 // from the proxy: Claude Code's picker is built from its own catalog plus
 // `modelPicker.options`, and never from the /v1/models endpoint.
-func printSettingsJSON(registry *codex.Registry) error {
+func printSettingsJSON(rows []catalog.PickerRow) error {
 	block := map[string]any{
 		"modelPicker": map[string]any{
-			"options": registry.PickerOptions(),
+			"options": rows,
 		},
 	}
 	if err := printJSON(block); err != nil {

@@ -8,15 +8,15 @@ import (
 )
 
 // StripProxySignatures removes assistant thinking blocks whose signature this
-// proxy issued for a Codex turn.
+// proxy issued for a turn answered by one of its backends.
 //
 // Claude Code replays prior assistant turns verbatim, so a session that
-// switched from a Codex model back to a Claude model would otherwise send
-// Codex reasoning state to Anthropic, which rejects the request. The check is
-// a byte scan first, so requests that never touched a Codex model are returned
-// untouched and pass through unmodified.
+// switched from an added model back to a Claude model would otherwise send
+// that backend's reasoning to Anthropic, which rejects the request. The check
+// is a byte scan first, so requests that never touched an added model are
+// returned untouched and pass through unmodified.
 func StripProxySignatures(raw []byte) ([]byte, bool) {
-	if !bytes.Contains(raw, []byte(SignatureMarker)) {
+	if !containsAnyMarker(raw) {
 		return raw, false
 	}
 	messages := gjson.GetBytes(raw, "messages")
@@ -37,7 +37,7 @@ func StripProxySignatures(raw []byte) ([]byte, bool) {
 		dropped := false
 		content.ForEach(func(_, block gjson.Result) bool {
 			if block.Get("type").String() == "thinking" {
-				if _, ours := stripSignatureMarker(block.Get("signature").String()); ours {
+				if issuedByProxy(block.Get("signature").String()) {
 					dropped = true
 					return true
 				}
@@ -54,4 +54,13 @@ func StripProxySignatures(raw []byte) ([]byte, bool) {
 	})
 
 	return out, changed
+}
+
+func containsAnyMarker(raw []byte) bool {
+	for _, dialect := range dialects {
+		if bytes.Contains(raw, []byte(dialect.Marker)) {
+			return true
+		}
+	}
+	return false
 }

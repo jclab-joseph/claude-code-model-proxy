@@ -152,3 +152,50 @@ func TestDefaultPathPrefersYAML(t *testing.T) {
 		t.Fatalf("DefaultPath() = %q, want config.yaml first", got)
 	}
 }
+
+func TestOpenRouterConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, `
+openrouter:
+  provider:
+    sort: price
+  models:
+    - id: z-ai/glm-5.3-flash
+      behaves_as: claude-sonnet-5
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.OpenRouter.Enabled() || cfg.OpenRouter.Models[0].ID != "z-ai/glm-5.3-flash" {
+		t.Fatalf("openrouter = %+v", cfg.OpenRouter)
+	}
+	if cfg.OpenRouter.BaseURL != "https://openrouter.ai/api/v1" || cfg.OpenRouter.APIKeyEnv != "OPENROUTER_API_KEY" {
+		t.Fatalf("defaults were not filled in: %+v", cfg.OpenRouter)
+	}
+	t.Setenv("OPENROUTER_API_KEY", " sk-or-env ")
+	if got := cfg.OpenRouter.Key(); got != "sk-or-env" {
+		t.Fatalf("Key() = %q", got)
+	}
+	if Default().OpenRouter.Enabled() {
+		t.Fatal("OpenRouter must be off until a model is configured")
+	}
+}
+
+func TestOpenRouterDataCollectionMustBeDeny(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	writeFile(t, path, "openrouter:\n  provider:\n    data_collection: allow\n  models:\n    - id: m\n")
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "data_collection") {
+		t.Fatalf("err = %v, want a data_collection error", err)
+	}
+
+	writeFile(t, path, "openrouter:\n  provider:\n    data_collection: deny\n  models:\n    - id: m\n")
+	if _, err := Load(path); err != nil {
+		t.Fatalf("deny must be accepted: %v", err)
+	}
+
+	writeFile(t, path, "openrouter:\n  models:\n    - display_name: no id\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("a model without an id must be rejected")
+	}
+}
