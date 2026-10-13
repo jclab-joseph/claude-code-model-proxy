@@ -678,6 +678,35 @@ The suite runs the whole path without network access:
   that `data_collection` is `deny` whatever the configuration says, and that
   each provider replays only its own reasoning.
 
+### End-to-end tests
+
+`e2e/` drives the real Claude Code CLI through a freshly built proxy, against
+the real upstreams. It costs money and needs a signed-in Claude Code, so it
+only builds with a tag:
+
+```sh
+go test -tags e2e -v -timeout 60m ./e2e
+```
+
+Each scenario runs for every main model (`CCM_E2E_MODELS`, default
+`z-ai/glm-5.3-flash,gpt-5.5`); a model whose provider has no credentials is
+skipped. `OPENROUTER_API_KEY` is read from the environment or the repository's
+`.env`.
+
+| Scenario | What it catches |
+| --- | --- |
+| `Reply` | the basic round trip, and the model name the client sees |
+| `FixWithTools` | Read, Edit and Bash across several turns |
+| `ParallelReads` | parallel tool results attached to the wrong call |
+| `Subagent` | a general-purpose subagent on the same provider |
+| `SubagentOnClaude` | the main agent on the added model, a subagent on Claude (`CCM_E2E_SUBAGENT_MODEL`, default `opus`) |
+| `SwitchFromClaude` | Claude → added model → Claude in one session, where Claude Code's message-thread continues drop the tools |
+| `Compact` | `/compact` on the added model |
+
+Set `CCM_E2E_KEEP=1` to keep the work directory: every turn's stream-json
+transcript and the proxy's debug log are there, and a failure names both.
+
+
 ## Security notes
 
 - **The CA private key is never stored.** It exists only in memory, signs the
